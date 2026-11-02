@@ -10,6 +10,11 @@ import 'package:mobile_scanner/mobile_scanner.dart';
 import 'package:video_player/video_player.dart';
 import 'package:chewie/chewie.dart';
 import 'package:flutter_overlay_window/flutter_overlay_window.dart';
+import 'package:package_info_plus/package_info_plus.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:open_filex/open_filex.dart';
+
+const String kGithubRepo = 'nandan8983/DirectStream';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -25,6 +30,181 @@ void overlayMain() {
   ));
 }
 
+// ============================================================================
+// GITHUB AUTO-UPDATER SERVICE (Checks nandan8983/DirectStream Releases)
+// ============================================================================
+class GitHubAutoUpdater {
+  static Future<void> checkForUpdate(BuildContext context, {bool silentIfUpToDate = true}) async {
+    try {
+      final PackageInfo packageInfo = await PackageInfo.fromPlatform();
+      final int currentBuild = int.tryParse(packageInfo.buildNumber) ?? 1;
+      final String currentVersion = packageInfo.version;
+
+      final response = await http.get(
+        Uri.parse('https://api.github.com/repos/$kGithubRepo/releases/latest'),
+        headers: {'Accept': 'application/vnd.github.v3+json'},
+      ).timeout(const Duration(seconds: 8));
+
+      if (response.statusCode != 200) {
+        if (!silentIfUpToDate && context.mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('No newer GitHub release found yet.')),
+          );
+        }
+        return;
+      }
+
+      final Map<String, dynamic> release = jsonDecode(response.body);
+      final String tagName = (release['tag_name'] ?? '').toString(); // e.g. "v0.0.4+4" or "v0.0.3-build5"
+      final String releaseNotes = (release['body'] ?? 'New version compiled via GitHub Actions.').toString();
+
+      // Extract build number from tag (format: v0.0.3+4 or v0.0.3-4)
+      int remoteBuild = currentBuild;
+      final RegExp buildRegex = RegExp(r'[+\-](\d+)$');
+      final Match? buildMatch = buildRegex.firstMatch(tagName);
+      if (buildMatch != null) {
+        remoteBuild = int.tryParse(buildMatch.group(1)!) ?? currentBuild;
+      }
+
+      final bool hasNewerBuild = remoteBuild > currentBuild ||
+          (tagName.isNotEmpty && !tagName.contains(currentVersion) && remoteBuild >= currentBuild);
+
+      if (!hasNewerBuild) {
+        if (!silentIfUpToDate && context.mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('You are on the latest version (v$currentVersion+$currentBuild).')),
+          );
+        }
+        return;
+      }
+
+      // Find the .apk asset download URL inside the latest GitHub Release
+      String? apkDownloadUrl;
+      final List<dynamic> assets = release['assets'] ?? [];
+      for (final asset in assets) {
+        final String name = (asset['name'] ?? '').toString();
+        if (name.endsWith('.apk')) {
+          apkDownloadUrl = asset['browser_download_url'];
+          break;
+        }
+      }
+
+      if (apkDownloadUrl != null && context.mounted) {
+        _showUpdateDialog(
+          context,
+          tagName: tagName,
+          currentVersion: 'v$currentVersion+$currentBuild',
+          notes: releaseNotes,
+          apkUrl: apkDownloadUrl,
+        );
+      }
+    } catch (e) {
+      if (!silentIfUpToDate && context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Update check failed: $e')),
+        );
+      }
+    }
+  }
+
+  static void _showUpdateDialog(
+    BuildContext context, {
+    required String tagName,
+    required String currentVersion,
+    required String notes,
+    required String apkUrl,
+  }) {
+    bool isDownloading = false;
+    double progress = 0.0;
+    String statusText = '';
+
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDialogState) => AlertDialog(
+          title: Row(
+            children: [
+              const Icon(Icons.system_update, color: Colors.tealAccent),
+              const SizedBox(width: 10),
+              Expanded(child: Text('Update Available ($tagName)')),
+            ],
+          ),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text('Installed: $currentVersion', style: const TextStyle(color: Colors.grey, fontSize: 13)),
+              const SizedBox(height: 8),
+              Text(notes, maxLines: 4, overflow: TextOverflow.ellipsis),
+              if (isDownloading) ...[
+                const SizedBox(height: 20),
+                LinearProgressIndicator(value: progress > 0 ? progress : null, color: Colors.tealAccent),
+                const SizedBox(height: 8),
+                Text(statusText, style: const TextStyle(fontSize: 13, color: Colors.tealAccent)),
+              ],
+            ],
+          ),
+          actions: [
+            if (!isDownloading)
+              TextButton(
+                onPressed: () => Navigator.pop(ctx),
+                child: const Text('Later', style: TextStyle(color: Colors.grey)),
+              ),
+            ElevatedButton.icon(
+              autofocus: true,
+              onPressed: isDownloading
+                  ? null
+                  : () async {
+                      setDialogState(() {
+                        isDownloading = true;
+                        statusText = 'Downloading APK from GitHub...';
+                      });
+                      try {
+                        final req = http.Request('GET', Uri.parse(apkUrl));
+                        final streamedRes = await http.Client().send(req);
+                        final totalBytes = streamedRes.contentLength ?? 0;
+                        int receivedBytes = 0;
+
+                        final dir = await getTemporaryDirectory();
+                        final apkFile = File('${dir.path}/DirectStream-update.apk');
+                        final sink = apkFile.openWrite();
+
+                        await for (final chunk in streamedRes.stream) {
+                          receivedBytes += chunk.length;
+                          sink.add(chunk);
+                          if (totalBytes > 0) {
+                            setDialogState(() {
+                              progress = receivedBytes / totalBytes;
+                              statusText =
+                                  'Downloading: ${(progress * 100).toStringAsFixed(0)}%';
+                            });
+                          }
+                        }
+                        await sink.close();
+
+                        setDialogState(() {
+                          statusText = 'Launching installer...';
+                        });
+                        if (ctx.mounted) Navigator.pop(ctx);
+                        await OpenFilex.open(apkFile.path);
+                      } catch (e) {
+                        setDialogState(() {
+                          isDownloading = false;
+                          statusText = 'Download failed: $e';
+                        });
+                      }
+                    },
+              icon: const Icon(Icons.download),
+              label: Text(isDownloading ? 'Updating...' : 'Update Now'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
 class DirectStreamApp extends StatelessWidget {
   const DirectStreamApp({super.key});
 
@@ -36,14 +216,14 @@ class DirectStreamApp extends StatelessWidget {
         LogicalKeySet(LogicalKeyboardKey.enter): const ActivateIntent(),
       },
       child: MaterialApp(
-        title: 'DirectStream v0.01',
+        title: 'DirectStream',
         debugShowCheckedModeBanner: false,
         theme: ThemeData.dark().copyWith(
           colorScheme: const ColorScheme.dark(
             primary: Colors.tealAccent,
             secondary: Colors.cyanAccent,
           ),
-          scaffoldBackgroundColor: const Color(0xFF121212),
+          scaffoldBackgroundColor: const Color(0xFF0F171E),
         ),
         home: const ModeSelectionScreen(),
       ),
@@ -51,53 +231,119 @@ class DirectStreamApp extends StatelessWidget {
   }
 }
 
-class ModeSelectionScreen extends StatelessWidget {
+class ModeSelectionScreen extends StatefulWidget {
   const ModeSelectionScreen({super.key});
+
+  @override
+  State<ModeSelectionScreen> createState() => _ModeSelectionScreenState();
+}
+
+class _ModeSelectionScreenState extends State<ModeSelectionScreen> {
+  String _versionLabel = 'v0.0.3';
+
+  @override
+  void initState() {
+    super.initState();
+    _loadPackageVersion();
+    // Automatically check GitHub Releases on launch
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      GitHubAutoUpdater.checkForUpdate(context, silentIfUpToDate: true);
+    });
+  }
+
+  Future<void> _loadPackageVersion() async {
+    final info = await PackageInfo.fromPlatform();
+    if (mounted) {
+      setState(() {
+        _versionLabel = 'v${info.version}+${info.buildNumber}';
+      });
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
+      appBar: AppBar(
+        backgroundColor: Colors.transparent,
+        elevation: 0,
+        actions: [
+          TextButton.icon(
+            onPressed: () => GitHubAutoUpdater.checkForUpdate(context, silentIfUpToDate: false),
+            icon: const Icon(Icons.system_update, size: 18, color: Colors.tealAccent),
+            label: Text('Check Update ($_versionLabel)', style: const TextStyle(color: Colors.tealAccent)),
+          ),
+          const SizedBox(width: 12),
+        ],
+      ),
       body: Center(
-        child: Container(
-          constraints: const BoxConstraints(maxWidth: 500),
-          padding: const EdgeInsets.all(24),
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              const Icon(Icons.cast_connected, size: 72, color: Colors.tealAccent),
-              const SizedBox(height: 16),
-              const Text(
-                'DirectStream v0.01',
-                style: TextStyle(fontSize: 28, fontWeight: FontWeight.bold),
-              ),
-              const SizedBox(height: 8),
-              const Text(
-                'Select device role for this session:',
-                style: TextStyle(color: Colors.grey, fontSize: 16),
-              ),
-              const SizedBox(height: 36),
-              _RoleCard(
-                autofocus: true,
-                icon: Icons.tv,
-                title: 'TV Receiver Mode',
-                subtitle: 'Displays QR code, listens in background & plays streams',
-                onTap: () => Navigator.pushReplacement(
-                  context,
-                  MaterialPageRoute(builder: (_) => const TvReceiverScreen()),
+        child: SingleChildScrollView(
+          child: Container(
+            constraints: const BoxConstraints(maxWidth: 500),
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                // Custom App Logo Widget
+                Container(
+                  width: 96,
+                  height: 96,
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF16222D),
+                    borderRadius: BorderRadius.circular(24),
+                    border: Border.all(color: Colors.tealAccent.withOpacity(0.5), width: 2),
+                    boxShadow: [
+                      BoxShadow(
+                        color: Colors.tealAccent.withOpacity(0.15),
+                        blurRadius: 20,
+                        spreadRadius: 2,
+                      ),
+                    ],
+                  ),
+                  child: const Stack(
+                    alignment: Alignment.center,
+                    children: [
+                      Icon(Icons.tv, size: 64, color: Colors.tealAccent),
+                      Padding(
+                        padding: EdgeInsets.only(bottom: 6),
+                        child: Icon(Icons.play_arrow_rounded, size: 34, color: Colors.cyanAccent),
+                      ),
+                    ],
+                  ),
                 ),
-              ),
-              const SizedBox(height: 16),
-              _RoleCard(
-                autofocus: false,
-                icon: Icons.smartphone,
-                title: 'Phone Controller Mode',
-                subtitle: 'Extracts embedded/IPTV URLs and casts to TV',
-                onTap: () => Navigator.pushReplacement(
-                  context,
-                  MaterialPageRoute(builder: (_) => const ControllerScreen()),
+                const SizedBox(height: 16),
+                const Text(
+                  'DirectStream',
+                  style: TextStyle(fontSize: 28, fontWeight: FontWeight.bold),
                 ),
-              ),
-            ],
+                const SizedBox(height: 4),
+                Text(
+                  'GitHub Auto-Update Enabled • $_versionLabel',
+                  style: const TextStyle(color: Colors.tealAccent, fontSize: 13),
+                ),
+                const SizedBox(height: 32),
+                _RoleCard(
+                  autofocus: true,
+                  icon: Icons.tv,
+                  title: 'TV Receiver Mode',
+                  subtitle: 'Displays QR code, listens in background & plays streams',
+                  onTap: () => Navigator.pushReplacement(
+                    context,
+                    MaterialPageRoute(builder: (_) => const TvReceiverScreen()),
+                  ),
+                ),
+                const SizedBox(height: 16),
+                _RoleCard(
+                  autofocus: false,
+                  icon: Icons.smartphone,
+                  title: 'Phone Controller Mode',
+                  subtitle: 'Extracts embedded/IPTV URLs and casts to TV',
+                  onTap: () => Navigator.pushReplacement(
+                    context,
+                    MaterialPageRoute(builder: (_) => const ControllerScreen()),
+                  ),
+                ),
+              ],
+            ),
           ),
         ),
       ),
@@ -361,11 +607,16 @@ class _TvReceiverScreenState extends State<TvReceiverScreen> with WidgetsBinding
       appBar: AppBar(
         title: const Text('TV Receiver Standby'),
         actions: [
+          IconButton(
+            icon: const Icon(Icons.system_update, color: Colors.tealAccent),
+            tooltip: 'Check GitHub for Update',
+            onPressed: () => GitHubAutoUpdater.checkForUpdate(context, silentIfUpToDate: false),
+          ),
           Center(
             child: Padding(
-              padding: const EdgeInsets.only(right: 20),
+              padding: const EdgeInsets.only(right: 20, left: 8),
               child: Text(
-                'Connected Controllers: ${_sockets.length}',
+                'Connected: ${_sockets.length}',
                 style: TextStyle(
                   color: _sockets.isNotEmpty ? Colors.tealAccent : Colors.grey,
                   fontWeight: FontWeight.bold,
@@ -376,44 +627,47 @@ class _TvReceiverScreenState extends State<TvReceiverScreen> with WidgetsBinding
         ],
       ),
       body: Center(
-        child: Row(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            Container(
-              padding: const EdgeInsets.all(16),
-              decoration: BoxDecoration(
-                color: Colors.white,
-                borderRadius: BorderRadius.circular(16),
+        child: SingleChildScrollView(
+          scrollDirection: Axis.horizontal,
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Container(
+                padding: const EdgeInsets.all(16),
+                decoration: BoxDecoration(
+                  color: Colors.white,
+                  borderRadius: BorderRadius.circular(16),
+                ),
+                child: QrImageView(
+                  data: _pairingAddress,
+                  version: QrVersions.auto,
+                  size: 220.0,
+                ),
               ),
-              child: QrImageView(
-                data: _pairingAddress,
-                version: QrVersions.auto,
-                size: 220.0,
+              const SizedBox(width: 40),
+              Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    'Scan with Controller App',
+                    style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    'Manual Server URL: $_pairingAddress',
+                    style: const TextStyle(fontSize: 16, color: Colors.tealAccent),
+                  ),
+                  const SizedBox(height: 16),
+                  const Text(
+                    '• While this screen is open, streams play immediately.\n'
+                    '• When minimized, incoming streams trigger an Accept/Reject popup.',
+                    style: TextStyle(color: Colors.grey, height: 1.5),
+                  ),
+                ],
               ),
-            ),
-            const SizedBox(width: 40),
-            Column(
-              mainAxisAlignment: MainAxisAlignment.center,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                const Text(
-                  'Scan with Controller App',
-                  style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
-                ),
-                const SizedBox(height: 8),
-                Text(
-                  'Manual Server URL: $_pairingAddress',
-                  style: const TextStyle(fontSize: 16, color: Colors.tealAccent),
-                ),
-                const SizedBox(height: 16),
-                const Text(
-                  '• While this screen is open, streams play immediately.\n'
-                  '• When minimized, incoming streams trigger an Accept/Reject popup.',
-                  style: TextStyle(color: Colors.grey, height: 1.5),
-                ),
-              ],
-            ),
-          ],
+            ],
+          ),
         ),
       ),
     );
@@ -514,24 +768,48 @@ class _ControllerScreenState extends State<ControllerScreen> {
   final TextEditingController _urlInputCtrl = TextEditingController();
   List<String> _extractedStreams = [];
 
-  Future<void> _connectToTv(String wsUrl) async {
+  String _normalizeWsAddress(String rawInput) {
+    String cleaned = rawInput.trim();
+    if (!cleaned.startsWith('ws://') && !cleaned.startsWith('wss://')) {
+      cleaned = 'ws://$cleaned';
+    }
+    final dotPortRegex = RegExp(r'^(wss?://\d+\.\d+\.\d+\.\d+)\.(\d+)$');
+    final match = dotPortRegex.firstMatch(cleaned);
+    if (match != null) {
+      cleaned = '${match.group(1)}:${match.group(2)}';
+    }
+    final noPortRegex = RegExp(r'^(wss?://\d+\.\d+\.\d+\.\d+)$');
+    if (noPortRegex.hasMatch(cleaned)) {
+      cleaned = '$cleaned:8080';
+    }
+    return cleaned;
+  }
+
+  Future<void> _connectToTv(String rawWsUrl) async {
+    final wsUrl = _normalizeWsAddress(rawWsUrl);
+    setState(() {
+      _wsAddressCtrl.text = wsUrl;
+    });
+
     try {
       final ws = await WebSocket.connect(wsUrl).timeout(const Duration(seconds: 5));
+      if (!mounted) return;
       setState(() {
         _socket = ws;
         _isConnected = true;
-        _wsAddressCtrl.text = wsUrl;
       });
       ws.listen(
         null,
-        onDone: () => setState(() => _isConnected = false),
-        onError: (_) => setState(() => _isConnected = false),
+        onDone: () {
+          if (mounted) setState(() => _isConnected = false);
+        },
+        onError: (_) {
+          if (mounted) setState(() => _isConnected = false);
+        },
       );
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Paired with TV Receiver!'), backgroundColor: Colors.teal),
-        );
-      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Paired with TV Receiver ($wsUrl)!'), backgroundColor: Colors.teal),
+      );
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -541,27 +819,17 @@ class _ControllerScreenState extends State<ControllerScreen> {
     }
   }
 
-  void _openQrScanner() {
-    Navigator.push(
+  Future<void> _openQrScanner() async {
+    final String? scannedCode = await Navigator.push<String>(
       context,
       MaterialPageRoute(
-        builder: (ctx) => Scaffold(
-          appBar: AppBar(title: const Text('Scan TV QR Code')),
-          body: MobileScanner(
-            onDetect: (capture) {
-              for (final barcode in capture.barcodes) {
-                final code = barcode.rawValue;
-                if (code != null && code.startsWith('ws://')) {
-                  Navigator.pop(ctx);
-                  _connectToTv(code);
-                  break;
-                }
-              }
-            },
-          ),
-        ),
+        builder: (_) => const QrScannerPage(),
       ),
     );
+
+    if (scannedCode != null && scannedCode.isNotEmpty && mounted) {
+      await _connectToTv(scannedCode);
+    }
   }
 
   Future<void> _extractVideoStreams(String rawUrl) async {
@@ -634,8 +902,13 @@ class _ControllerScreenState extends State<ControllerScreen> {
       appBar: AppBar(
         title: const Text('Phone Controller'),
         actions: [
+          IconButton(
+            icon: const Icon(Icons.system_update, color: Colors.tealAccent),
+            tooltip: 'Check GitHub Update',
+            onPressed: () => GitHubAutoUpdater.checkForUpdate(context, silentIfUpToDate: false),
+          ),
           Padding(
-            padding: const EdgeInsets.only(right: 16),
+            padding: const EdgeInsets.only(right: 16, left: 4),
             child: Icon(
               _isConnected ? Icons.cast_connected : Icons.cast,
               color: _isConnected ? Colors.tealAccent : Colors.grey,
@@ -663,7 +936,7 @@ class _ControllerScreenState extends State<ControllerScreen> {
                         child: TextField(
                           controller: _wsAddressCtrl,
                           decoration: const InputDecoration(
-                            labelText: 'TV WebSocket IP',
+                            labelText: 'TV WebSocket IP (e.g. ws://192.168.1.39:8080)',
                             border: OutlineInputBorder(),
                             isDense: true,
                           ),
@@ -671,7 +944,7 @@ class _ControllerScreenState extends State<ControllerScreen> {
                       ),
                       const SizedBox(width: 8),
                       ElevatedButton(
-                        onPressed: () => _connectToTv(_wsAddressCtrl.text.trim()),
+                        onPressed: () => _connectToTv(_wsAddressCtrl.text),
                         child: const Text('Connect'),
                       ),
                       const SizedBox(width: 8),
@@ -772,6 +1045,72 @@ class _ControllerScreenState extends State<ControllerScreen> {
                   onPressed: () => _sendCommand('PLAY', streamUrl: streamUrl),
                   child: const Text('Cast Now'),
                 ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class QrScannerPage extends StatefulWidget {
+  const QrScannerPage({super.key});
+
+  @override
+  State<QrScannerPage> createState() => _QrScannerPageState();
+}
+
+class _QrScannerPageState extends State<QrScannerPage> {
+  final MobileScannerController _scannerController = MobileScannerController(
+    detectionSpeed: DetectionSpeed.noDuplicates,
+  );
+  bool _hasScanned = false;
+
+  @override
+  void dispose() {
+    _scannerController.dispose();
+    super.dispose();
+  }
+
+  void _onBarcodeDetected(BarcodeCapture capture) {
+    if (_hasScanned) return;
+    for (final barcode in capture.barcodes) {
+      final String? code = barcode.rawValue;
+      if (code != null && code.startsWith('ws://')) {
+        _hasScanned = true;
+        _scannerController.stop();
+        if (mounted) {
+          Navigator.of(context).pop(code);
+        }
+        break;
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Scan TV QR Code'),
+        leading: IconButton(
+          icon: const Icon(Icons.arrow_back),
+          onPressed: () => Navigator.of(context).pop(),
+        ),
+      ),
+      body: Stack(
+        children: [
+          MobileScanner(
+            controller: _scannerController,
+            onDetect: _onBarcodeDetected,
+          ),
+          Center(
+            child: Container(
+              width: 240,
+              height: 240,
+              decoration: BoxDecoration(
+                border: Border.all(color: Colors.tealAccent, width: 3),
+                borderRadius: BorderRadius.circular(16),
               ),
             ),
           ),

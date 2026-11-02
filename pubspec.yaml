@@ -1,7 +1,7 @@
 name: tv_cast_app
-description: Dual-mode TV Receiver & Mobile Controller Cast App (v0.01)
+description: Dual-mode TV Receiver & Mobile Controller Cast App with GitHub Auto-Updater
 publish_to: 'none'
-version: 0.0.1+1
+version: 0.0.3+3
 
 environment:
   sdk: '>=3.2.0 <4.0.0'
@@ -17,11 +17,24 @@ dependencies:
   video_player: ^2.8.3
   chewie: ^1.7.5
   flutter_overlay_window: ^0.4.3
+  package_info_plus: ^8.0.0
+  path_provider: ^2.1.2
+  open_filex: ^4.4.0
 
 dev_dependencies:
   flutter_test:
     sdk: flutter
   flutter_lints: ^3.0.0
+  flutter_launcher_icons: ^0.13.1
+
+flutter_launcher_icons:
+  android: true
+  ios: false
+  image_path: "assets/icon/app_icon.png"
+  adaptive_icon_background: "#0F171E"
+  adaptive_icon_foreground: "assets/icon/app_icon.png"
 
 flutter:
   uses-material-design: true
+  assets:
+    - assets/icon/app_icon.png
