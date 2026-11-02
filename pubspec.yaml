@@ -1,0 +1,27 @@
+name: tv_cast_app
+description: Dual-mode TV Receiver & Mobile Controller Cast App (v0.01)
+publish_to: 'none'
+version: 0.0.1+1
+
+environment:
+  sdk: '>=3.2.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  http: ^1.2.0
+  html: ^0.15.4
+  network_info_plus: ^5.0.2
+  qr_flutter: ^4.1.0
+  mobile_scanner: ^4.0.1
+  video_player: ^2.8.3
+  chewie: ^1.7.5
+  flutter_overlay_window: ^0.4.3
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.0
+
+flutter:
+  uses-material-design: true
