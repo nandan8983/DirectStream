@@ -1,41 +1,132 @@
-name: Build DirectStream APK
+name: Build & Release DirectStream APK
 
 on:
   push:
     branches: [ main, master ]
   workflow_dispatch:
 
+# Required to create/update GitHub Releases and push tags
+permissions:
+  contents: write
+
 jobs:
-  build-apk:
+  build-and-release:
     runs-on: ubuntu-latest
+
     steps:
+      # -----------------------------------------------------------------------
+      # 1. Checkout full history so we can push tags
+      # -----------------------------------------------------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
+      # -----------------------------------------------------------------------
+      # 2. Extract version & build number from pubspec.yaml
+      #    pubspec format:  version: 0.0.4+4
+      #    Produces:        VERSION=0.0.4+4   TAG=v0.0.4+4
+      # -----------------------------------------------------------------------
+      - name: Extract version from pubspec.yaml
+        id: version
+        run: |
+          RAW=$(grep '^version:' pubspec.yaml | sed 's/version://' | tr -d ' \r\n')
+          echo "VERSION=$RAW"       >> $GITHUB_OUTPUT
+          echo "TAG=v$RAW"          >> $GITHUB_OUTPUT
+          # Build number is the part after '+'
+          BUILD=$(echo "$RAW" | cut -d'+' -f2)
+          echo "BUILD=$BUILD"       >> $GITHUB_OUTPUT
+          echo "Detected version: $RAW  tag: v$RAW  build: $BUILD"
+
+      # -----------------------------------------------------------------------
+      # 3. Java + Flutter toolchain
+      # -----------------------------------------------------------------------
       - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Set up Flutter
+      - name: Set up Flutter (stable)
         uses: subosito/flutter-action@v2
         with:
           channel: 'stable'
+          cache: true
 
-      - name: Initialize Android Scaffolding if missing
+      # -----------------------------------------------------------------------
+      # 4. Bootstrap Android scaffolding (creates android/ folder if absent)
+      # -----------------------------------------------------------------------
+      - name: Initialize Android scaffolding
         run: |
           flutter create . --project-name tv_cast_app --platforms=android
           cp android_manifest_template.xml android/app/src/main/AndroidManifest.xml
 
+      # -----------------------------------------------------------------------
+      # 5. Install Dart/Flutter dependencies
+      # -----------------------------------------------------------------------
       - name: Install dependencies
         run: flutter pub get
 
-      - name: Build Debug APK
-        run: flutter build apk --debug
+      # -----------------------------------------------------------------------
+      # 6. Generate launcher icons (reads pubspec flutter_launcher_icons section)
+      # -----------------------------------------------------------------------
+      - name: Generate app launcher icons
+        run: dart run flutter_launcher_icons
 
-      - name: Upload APK Artifact
-        uses: actions/upload-artifact@v4
+      # -----------------------------------------------------------------------
+      # 7. Build a RELEASE APK (smaller, faster, suitable for distribution)
+      # -----------------------------------------------------------------------
+      - name: Build release APK
+        run: flutter build apk --release
+
+      # -----------------------------------------------------------------------
+      # 8. Rename APK so the asset filename contains the version tag
+      # -----------------------------------------------------------------------
+      - name: Rename APK to versioned filename
+        run: |
+          mkdir -p dist
+          cp build/app/outputs/flutter-apk/app-release.apk \
+             dist/DirectStream-${{ steps.version.outputs.TAG }}.apk
+          echo "APK ready: dist/DirectStream-${{ steps.version.outputs.TAG }}.apk"
+
+      # -----------------------------------------------------------------------
+      # 9. Delete any pre-existing release+tag with the same name so we can
+      #    overwrite it on a re-push of the same version.
+      # -----------------------------------------------------------------------
+      - name: Delete existing release and tag (if any)
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete "${{ steps.version.outputs.TAG }}" --yes 2>/dev/null || true
+          git push origin ":refs/tags/${{ steps.version.outputs.TAG }}" 2>/dev/null || true
+
+      # -----------------------------------------------------------------------
+      # 10. Create a proper GitHub Release with the APK as a downloadable asset.
+      #     The in-app auto-updater calls /releases/latest and looks for a
+      #     .apk asset — this step makes that work.
+      # -----------------------------------------------------------------------
+      - name: Create GitHub Release and upload APK
+        uses: softprops/action-gh-release@v2
         with:
-          name: DirectStream-v0.01-apk
-          path: build/app/outputs/flutter-apk/app-debug.apk
+          tag_name: ${{ steps.version.outputs.TAG }}
+          name: "DirectStream ${{ steps.version.outputs.TAG }}"
+          body: |
+            ## DirectStream ${{ steps.version.outputs.TAG }}
+
+            Auto-built release from commit `${{ github.sha }}`
+
+            ### What's new
+            See the commit history for details.
+
+            ### How to install / update
+            1. Download **DirectStream-${{ steps.version.outputs.TAG }}.apk** below.
+            2. On your Android device → Settings → **Install unknown apps** → allow your browser/file manager.
+            3. Open the downloaded APK and tap **Install**.
+
+            > The in-app **Check Update** button will detect this release automatically.
+          files: dist/DirectStream-${{ steps.version.outputs.TAG }}.apk
+          make_latest: true
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

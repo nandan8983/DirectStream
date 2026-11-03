@@ -1,4 +1,4 @@
-import 'dart:async';
+﻿import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
@@ -111,60 +111,119 @@ class PlaybackHistoryItem {
 // GITHUB AUTO-UPDATER SERVICE
 // ============================================================================
 class GitHubAutoUpdater {
-  static Future<void> checkForUpdate(BuildContext context, {bool silentIfUpToDate = true}) async {
+  /// Parses a semver-style string like "0.0.4" into comparable integers.
+  static List<int> _parseVersion(String v) {
+    return v
+        .replaceAll(RegExp(r'[^0-9.]'), '')
+        .split('.')
+        .map((p) => int.tryParse(p) ?? 0)
+        .toList();
+  }
+
+  /// Returns true when [remoteVer]/[remoteBuild] is strictly newer than local.
+  static bool _isNewer(
+      String remoteVer, int remoteBuild, String localVer, int localBuild) {
+    final rem = _parseVersion(remoteVer);
+    final loc = _parseVersion(localVer);
+    final len = max(rem.length, loc.length);
+    for (int i = 0; i < len; i++) {
+      final r = i < rem.length ? rem[i] : 0;
+      final l = i < loc.length ? loc[i] : 0;
+      if (r > l) return true;
+      if (r < l) return false;
+    }
+    // Version strings equal — compare build numbers
+    return remoteBuild > localBuild;
+  }
+
+  static Future<void> checkForUpdate(BuildContext context,
+      {bool silentIfUpToDate = true}) async {
     try {
       final PackageInfo packageInfo = await PackageInfo.fromPlatform();
-      final int currentBuild = int.tryParse(packageInfo.buildNumber) ?? 1;
-      final String currentVersion = packageInfo.version;
+      final int currentBuild = int.tryParse(packageInfo.buildNumber) ?? 0;
+      final String currentVersion = packageInfo.version; // e.g. "0.0.4"
 
       final response = await http.get(
-        Uri.parse('https://api.github.com/repos/$kGithubRepo/releases/latest'),
+        Uri.parse(
+            'https://api.github.com/repos/$kGithubRepo/releases/latest'),
         headers: {'Accept': 'application/vnd.github.v3+json'},
-      ).timeout(const Duration(seconds: 8));
+      ).timeout(const Duration(seconds: 10));
 
       if (response.statusCode != 200) {
         if (!silentIfUpToDate && context.mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('No newer GitHub release found yet.')),
+            SnackBar(
+              content: Text(
+                'No GitHub release found yet (HTTP ${response.statusCode}). '
+                'Push your code so Actions can build & publish a release.',
+              ),
+            ),
           );
         }
         return;
       }
 
       final Map<String, dynamic> release = jsonDecode(response.body);
-      final String tagName = (release['tag_name'] ?? '').toString();
-      final String releaseNotes = (release['body'] ?? 'New version compiled via GitHub Actions.').toString();
+      final String tagName =
+          (release['tag_name'] ?? '').toString().trim();
+      final String releaseNotes =
+          (release['body'] ?? 'New version available.').toString().trim();
 
-      int remoteBuild = currentBuild;
-      final RegExp buildRegex = RegExp(r'[+\-](\d+)$');
-      final Match? buildMatch = buildRegex.firstMatch(tagName);
-      if (buildMatch != null) {
-        remoteBuild = int.tryParse(buildMatch.group(1)!) ?? currentBuild;
-      }
+      // Parse remote version & build number from tag (e.g. "v0.0.5+5")
+      final String tagStripped =
+          tagName.startsWith('v') ? tagName.substring(1) : tagName;
+      final List<String> tagParts =
+          tagStripped.split(RegExp(r'[+\-]'));
+      final String remoteVersion =
+          tagParts.isNotEmpty ? tagParts[0] : tagStripped;
+      final int remoteBuild =
+          tagParts.length > 1 ? (int.tryParse(tagParts[1]) ?? 0) : 0;
 
-      final bool hasNewerBuild = remoteBuild > currentBuild ||
-          (tagName.isNotEmpty && !tagName.contains(currentVersion) && remoteBuild >= currentBuild);
+      final bool hasUpdate =
+          _isNewer(remoteVersion, remoteBuild, currentVersion, currentBuild);
 
-      if (!hasNewerBuild) {
+      if (!hasUpdate) {
         if (!silentIfUpToDate && context.mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text('You are on the latest version (v$currentVersion+$currentBuild).')),
+            SnackBar(
+              content: Text(
+                'You are already on the latest version '
+                '(v$currentVersion+$currentBuild).',
+              ),
+            ),
           );
         }
         return;
       }
 
+      // Find the APK download URL among the release assets
       String? apkDownloadUrl;
       final List<dynamic> assets = release['assets'] ?? [];
       for (final asset in assets) {
-        final String name = (asset['name'] ?? '').toString();
+        final String name =
+            (asset['name'] ?? '').toString().toLowerCase();
         if (name.endsWith('.apk')) {
-          apkDownloadUrl = asset['browser_download_url'];
+          apkDownloadUrl =
+              (asset['browser_download_url'] ?? '').toString();
           break;
         }
       }
 
-      if (apkDownloadUrl != null && context.mounted) {
+      if (apkDownloadUrl == null || apkDownloadUrl.isEmpty) {
+        if (!silentIfUpToDate && context.mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text(
+                'Update $tagName is available but the APK is not ready yet. '
+                'Check GitHub Actions for build progress.',
+              ),
+            ),
+          );
+        }
+        return;
+      }
+
+      if (context.mounted) {
         _showUpdateDialog(
           context,
           tagName: tagName,
@@ -209,14 +268,25 @@ class GitHubAutoUpdater {
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Text('Installed: $currentVersion', style: const TextStyle(color: Colors.grey, fontSize: 13)),
+              Text(
+                'Installed: $currentVersion',
+                style:
+                    const TextStyle(color: Colors.grey, fontSize: 13),
+              ),
               const SizedBox(height: 8),
-              Text(notes, maxLines: 4, overflow: TextOverflow.ellipsis),
+              Text(notes, maxLines: 5, overflow: TextOverflow.ellipsis),
               if (isDownloading) ...[
                 const SizedBox(height: 20),
-                LinearProgressIndicator(value: progress > 0 ? progress : null, color: Colors.tealAccent),
+                LinearProgressIndicator(
+                  value: progress > 0 ? progress : null,
+                  color: Colors.tealAccent,
+                ),
                 const SizedBox(height: 8),
-                Text(statusText, style: const TextStyle(fontSize: 13, color: Colors.tealAccent)),
+                Text(
+                  statusText,
+                  style: const TextStyle(
+                      fontSize: 13, color: Colors.tealAccent),
+                ),
               ],
             ],
           ),
@@ -224,7 +294,8 @@ class GitHubAutoUpdater {
             if (!isDownloading)
               TextButton(
                 onPressed: () => Navigator.pop(ctx),
-                child: const Text('Later', style: TextStyle(color: Colors.grey)),
+                child: const Text('Later',
+                    style: TextStyle(color: Colors.grey)),
               ),
             ElevatedButton.icon(
               autofocus: true,
@@ -233,17 +304,36 @@ class GitHubAutoUpdater {
                   : () async {
                       setDialogState(() {
                         isDownloading = true;
-                        statusText = 'Downloading APK from GitHub...';
+                        statusText = 'Connecting to GitHub...';
+                        progress = 0.0;
                       });
                       try {
-                        final req = http.Request('GET', Uri.parse(apkUrl));
-                        final streamedRes = await http.Client().send(req);
-                        final totalBytes = streamedRes.contentLength ?? 0;
+                        final httpClient = http.Client();
+                        final req =
+                            http.Request('GET', Uri.parse(apkUrl));
+                        final streamedRes = await httpClient
+                            .send(req)
+                            .timeout(const Duration(seconds: 30));
+
+                        if (streamedRes.statusCode != 200) {
+                          throw Exception(
+                              'Server returned HTTP ${streamedRes.statusCode}');
+                        }
+
+                        final totalBytes =
+                            streamedRes.contentLength ?? 0;
                         int receivedBytes = 0;
 
                         final dir = await getTemporaryDirectory();
-                        final apkFile = File('${dir.path}/DirectStream-update.apk');
+                        final apkFile =
+                            File('${dir.path}/DirectStream-update.apk');
+                        if (await apkFile.exists()) {
+                          await apkFile.delete();
+                        }
                         final sink = apkFile.openWrite();
+
+                        setDialogState(
+                            () => statusText = 'Downloading update...');
 
                         await for (final chunk in streamedRes.stream) {
                           receivedBytes += chunk.length;
@@ -251,14 +341,34 @@ class GitHubAutoUpdater {
                           if (totalBytes > 0) {
                             setDialogState(() {
                               progress = receivedBytes / totalBytes;
-                              statusText = 'Downloading: ${(progress * 100).toStringAsFixed(0)}%';
+                              final mb = (receivedBytes / 1048576)
+                                  .toStringAsFixed(1);
+                              final tot = (totalBytes / 1048576)
+                                  .toStringAsFixed(1);
+                              statusText =
+                                  'Downloading: ${(progress * 100).toStringAsFixed(0)}%  ($mb / $tot MB)';
                             });
                           }
                         }
+                        await sink.flush();
                         await sink.close();
+                        httpClient.close();
 
+                        setDialogState(
+                            () => statusText = 'Opening installer...');
                         if (ctx.mounted) Navigator.pop(ctx);
-                        await OpenFilex.open(apkFile.path);
+                        final result =
+                            await OpenFilex.open(apkFile.path);
+                        if (result.type != ResultType.done &&
+                            ctx.mounted) {
+                          ScaffoldMessenger.of(ctx).showSnackBar(
+                            SnackBar(
+                              content: Text(
+                                  'Could not open installer: ${result.message}'),
+                              backgroundColor: Colors.redAccent,
+                            ),
+                          );
+                        }
                       } catch (e) {
                         setDialogState(() {
                           isDownloading = false;
@@ -267,7 +377,8 @@ class GitHubAutoUpdater {
                       }
                     },
               icon: const Icon(Icons.download),
-              label: Text(isDownloading ? 'Updating...' : 'Update Now'),
+              label:
+                  Text(isDownloading ? 'Updating...' : 'Update Now'),
             ),
           ],
         ),
