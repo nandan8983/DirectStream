@@ -1,7 +1,7 @@
 name: tv_cast_app
 description: Dual-mode TV Receiver & Mobile Controller Cast App (v0.04)
 publish_to: 'none'
-version: 0.0.6+6
+version: 0.0.7+7
 
 environment:
   sdk: '>=3.2.0 <4.0.0'

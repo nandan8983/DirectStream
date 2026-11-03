@@ -424,7 +424,7 @@ class ModeSelectionScreen extends StatefulWidget {
 }
 
 class _ModeSelectionScreenState extends State<ModeSelectionScreen> {
-  String _versionLabel = 'v0.0.6';
+  String _versionLabel = 'v0.0.7';
 
   @override
   void initState() {
@@ -1573,11 +1573,309 @@ class _ControllerScreenState extends State<ControllerScreen> {
   }
 
   // ==========================================================================
-  // STREAM EXTRACTOR (YouTube + Instagram Reels/Posts + IPTV .m3u8 + Web MP4)
+  // STREAM EXTRACTOR (YouTube + Shorts/Live + Instagram Reels + Web/IPTV)
   // ==========================================================================
+
+  /// Extracts the 11-character YouTube video ID from any format:
+  /// watch?v=, shorts/, live/, embed/, v/, clip/, youtu.be/, or raw 11-char ID
+  String? _parseYouTubeVideoId(String input) {
+    final clean = input.trim();
+    // 1. Standard YouTube URL patterns
+    final regExp = RegExp(
+      r'(?:https?:\/\/)?(?:www\.|m\.|music\.)?(?:youtube\.com\/(?:watch\?(?:.*&)?v=|embed\/|v\/|shorts\/|live\/|clip\/)|youtu\.be\/)([a-zA-Z0-9_-]{11})',
+      caseSensitive: false,
+    );
+    final match = regExp.firstMatch(clean);
+    if (match != null && match.group(1) != null) {
+      return match.group(1);
+    }
+    // 2. Query param ?v=ID
+    final vParamMatch = RegExp(r'[?&]v=([a-zA-Z0-9_-]{11})').firstMatch(clean);
+    if (vParamMatch != null && vParamMatch.group(1) != null) {
+      return vParamMatch.group(1);
+    }
+    // 3. Raw 11-char ID
+    if (RegExp(r'^[a-zA-Z0-9_-]{11}$').hasMatch(clean)) {
+      return clean;
+    }
+    return null;
+  }
+
+  /// Extracts direct video streams for standard VOD, Shorts, and Live streams.
+  Future<List<StreamQualityOption>> _extractYouTubeStreams(String videoId) async {
+    final List<StreamQualityOption> list = [];
+    final ytExplode = yt.YoutubeExplode();
+    final ytId = yt.VideoId(videoId);
+
+    try {
+      final video = await ytExplode.videos.get(ytId);
+      _extractedTitle = video.title;
+
+      if (video.isLive) {
+        // Active Live Stream -> get HLS live stream URL (.m3u8)
+        try {
+          final liveUrl = await ytExplode.videos.streamsClient.getHttpLiveStreamUrl(ytId);
+          if (liveUrl.isNotEmpty) {
+            list.add(StreamQualityOption(
+              label: 'YouTube Live (HLS)',
+              url: liveUrl,
+            ));
+          }
+        } catch (_) {}
+      } else {
+        // Standard VOD or Shorts -> get muxed / HLS streams
+        try {
+          final manifest = await ytExplode.videos.streamsClient.getManifest(ytId);
+          final muxed = manifest.muxed.sortByVideoQuality();
+          final Set<String> seenLabels = {};
+          for (final s in muxed) {
+            final label = s.qualityLabel;
+            if (!seenLabels.contains(label)) {
+              seenLabels.add(label);
+              list.add(StreamQualityOption(label: label, url: s.url.toString()));
+            }
+          }
+          if (manifest.hls.isNotEmpty) {
+            list.add(StreamQualityOption(
+              label: 'Auto (HLS)',
+              url: manifest.hls.first.url.toString(),
+            ));
+          }
+        } catch (_) {
+          // If manifest throws (e.g. live stream transition), fallback to live stream URL
+          try {
+            final fallbackUrl = await ytExplode.videos.streamsClient.getHttpLiveStreamUrl(ytId);
+            if (fallbackUrl.isNotEmpty) {
+              list.add(StreamQualityOption(label: 'Live / HLS Stream', url: fallbackUrl));
+            }
+          } catch (_) {}
+        }
+      }
+    } catch (_) {
+      // If metadata lookup fails, try direct live stream URL as last resort
+      try {
+        final fallbackUrl = await ytExplode.videos.streamsClient.getHttpLiveStreamUrl(ytId);
+        if (fallbackUrl.isNotEmpty) {
+          _extractedTitle = 'YouTube Stream';
+          list.add(StreamQualityOption(label: 'Live Stream (HLS)', url: fallbackUrl));
+        }
+      } catch (_) {}
+    } finally {
+      ytExplode.close();
+    }
+
+    return list;
+  }
+
+  /// Extracts direct MP4 video from Instagram Reels and Posts
+  Future<List<StreamQualityOption>> _extractInstagramVideo(String rawInput) async {
+    final List<StreamQualityOption> list = [];
+    final Set<String> urls = {};
+
+    // 1. Extract shortcode
+    final scMatch = RegExp(r'instagram\.com\/(?:reel|reels|p|share\/reel)\/([a-zA-Z0-9_-]+)').firstMatch(rawInput);
+    final shortcode = scMatch?.group(1);
+    if (shortcode == null) return list;
+
+    // 2. Query official web client JSON API with X-IG-App-ID
+    try {
+      final jsonUrl = 'https://www.instagram.com/p/$shortcode/?__a=1&__d=dis';
+      final res = await http.get(
+        Uri.parse(jsonUrl),
+        headers: {
+          'User-Agent':
+              'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+          'X-IG-App-ID': '936619743392459',
+          'Accept': 'application/json, text/plain, */*',
+        },
+      ).timeout(const Duration(seconds: 6));
+
+      if (res.statusCode == 200 && res.body.trim().startsWith('{')) {
+        final data = jsonDecode(res.body);
+        if (data is Map<String, dynamic>) {
+          // Check items[0].video_versions
+          final items = data['items'] as List?;
+          if (items != null && items.isNotEmpty) {
+            final firstItem = items[0] as Map<String, dynamic>?;
+            final videoVersions = firstItem?['video_versions'] as List?;
+            if (videoVersions != null) {
+              for (final v in videoVersions) {
+                final u = v['url']?.toString();
+                if (u != null && !urls.contains(u)) {
+                  urls.add(u);
+                  final width = v['width'] ?? '';
+                  final height = v['height'] ?? '';
+                  final label = (width != '' && height != '')
+                      ? '${width}x$height'
+                      : (list.isEmpty ? 'Instagram HD' : 'Stream #${list.length + 1}');
+                  list.add(StreamQualityOption(label: label, url: u));
+                }
+              }
+            }
+          }
+          // Check graphql.shortcode_media.video_url
+          final graphql = data['graphql'] as Map<String, dynamic>?;
+          final shortcodeMedia = graphql?['shortcode_media'] as Map<String, dynamic>?;
+          final videoUrl = shortcodeMedia?['video_url']?.toString();
+          if (videoUrl != null && !urls.contains(videoUrl)) {
+            urls.add(videoUrl);
+            list.add(StreamQualityOption(
+              label: list.isEmpty ? 'Instagram HD' : 'Stream #${list.length + 1}',
+              url: videoUrl,
+            ));
+          }
+        }
+      }
+    } catch (_) {}
+
+    if (list.isNotEmpty) return list;
+
+    // 3. Fallback: Parse embed captioned page
+    try {
+      final embedUrl = 'https://www.instagram.com/p/$shortcode/embed/captioned/';
+      final res = await http.get(
+        Uri.parse(embedUrl),
+        headers: {
+          'User-Agent':
+              'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
+        },
+      ).timeout(const Duration(seconds: 6));
+
+      if (res.statusCode == 200) {
+        final decoded = res.body
+            .replaceAll(r'\/', '/')
+            .replaceAll(r'\u0026', '&')
+            .replaceAll('&amp;', '&');
+
+        final ogRegex = RegExp(r'property="og:video"\s+content="([^"]+)"');
+        final jsonVideoRegex = RegExp(r'"video_url"\s*:\s*"([^"]+)"');
+        final mp4Regex = RegExp(r'(https?://[^\s"<>]+\.mp4\?[^\s"<>]*)');
+
+        for (final m in [
+          ...ogRegex.allMatches(decoded),
+          ...jsonVideoRegex.allMatches(decoded),
+          ...mp4Regex.allMatches(decoded),
+        ]) {
+          final u = m.group(1);
+          if (u != null && u.startsWith('http') && !urls.contains(u)) {
+            urls.add(u);
+            list.add(StreamQualityOption(
+              label: list.isEmpty ? 'Instagram HD' : 'Stream #${list.length + 1}',
+              url: u,
+            ));
+          }
+        }
+      }
+    } catch (_) {}
+
+    return list;
+  }
+
+  /// Scrapes embedded video, iframes, HTML5 video tags, and metadata from webpages
+  Future<List<StreamQualityOption>> _scrapeWebpageVideos(String pageUrl) async {
+    final List<StreamQualityOption> results = [];
+    final Set<String> seenUrls = {};
+    final baseUri = Uri.parse(pageUrl);
+
+    try {
+      final response = await http.get(
+        baseUri,
+        headers: {
+          'User-Agent':
+              'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        },
+      ).timeout(const Duration(seconds: 8));
+
+      if (response.statusCode == 200) {
+        final body = response.body;
+
+        // 1. Page title
+        final titleMatch = RegExp(r'<title[^>]*>(.*?)</title>', caseSensitive: false).firstMatch(body);
+        if (titleMatch != null && titleMatch.group(1) != null) {
+          _extractedTitle = titleMatch.group(1)!.trim();
+        }
+
+        // 2. Check for embedded YouTube iframe or link
+        final ytEmbeddedMatch = RegExp(
+          r'(?:youtube\.com\/(?:embed\/|watch\?v=)|youtu\.be\/)([a-zA-Z0-9_-]{11})',
+          caseSensitive: false,
+        ).firstMatch(body);
+        if (ytEmbeddedMatch != null && ytEmbeddedMatch.group(1) != null) {
+          final ytId = ytEmbeddedMatch.group(1)!;
+          final ytStreams = await _extractYouTubeStreams(ytId);
+          results.addAll(ytStreams);
+        }
+
+        // 3. OpenGraph / Twitter video meta tags
+        final metaRegex = RegExp(
+          r'''<meta\s+[^>]*(?:property|name)=["'](?:og:video|og:video:url|og:video:secure_url|twitter:player:stream)["']\s+content=["']([^"']+)["']''',
+          caseSensitive: false,
+        );
+        for (final m in metaRegex.allMatches(body)) {
+          final u = m.group(1);
+          if (u != null && u.isNotEmpty) {
+            final resolved = baseUri.resolve(u).toString();
+            if (!seenUrls.contains(resolved)) {
+              seenUrls.add(resolved);
+              final label = resolved.contains('.m3u8') ? 'HLS Stream (Meta)' : 'Direct Video (Meta)';
+              results.add(StreamQualityOption(label: label, url: resolved));
+            }
+          }
+        }
+
+        // 4. HTML5 <video src="..."> and <source src="..."> tags
+        final tagRegex = RegExp(
+          r'''<(?:video|source)\s+[^>]*src=["']([^"']+)["']''',
+          caseSensitive: false,
+        );
+        for (final m in tagRegex.allMatches(body)) {
+          final u = m.group(1);
+          if (u != null && u.isNotEmpty) {
+            final resolved = baseUri.resolve(u).toString();
+            if (!seenUrls.contains(resolved) &&
+                RegExp(r'\.(m3u8|mp4|webm|mkv|mpd)(\?.*)?$', caseSensitive: false).hasMatch(resolved)) {
+              seenUrls.add(resolved);
+              final label = resolved.contains('.m3u8') ? 'HLS Stream' : 'Direct Video';
+              results.add(StreamQualityOption(label: '$label #${results.length + 1}', url: resolved));
+            }
+          }
+        }
+
+        // 5. Script / JSON embedded stream URLs
+        final unescaped = body.replaceAll(r'\/', '/');
+        final scriptVideoRegex = RegExp(
+          r'''(https?://[^\s"'<>\\]+\.(?:m3u8|mp4|webm)(?:\?[^\s"'<>\\]*)?)''',
+          caseSensitive: false,
+        );
+        for (final m in scriptVideoRegex.allMatches(unescaped)) {
+          final u = m.group(0);
+          if (u != null && !seenUrls.contains(u)) {
+            seenUrls.add(u);
+            final label = u.contains('.m3u8') ? 'HLS Stream #${results.length + 1}' : 'Direct MP4 #${results.length + 1}';
+            results.add(StreamQualityOption(label: label, url: u));
+          }
+        }
+      }
+    } catch (_) {}
+
+    return results;
+  }
+
   Future<void> _extractVideoStreams(String rawUrl) async {
-    final cleanUrl = rawUrl.trim();
-    if (cleanUrl.isEmpty) return;
+    // Extract first URL if pasted text contains surrounding words
+    String cleanUrl = rawUrl.trim();
+    final linkMatch = RegExp(r'https?://[^\s<>"]+').firstMatch(cleanUrl);
+    if (linkMatch != null) {
+      cleanUrl = linkMatch.group(0)!;
+    }
+
+    if (cleanUrl.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Please enter or paste a valid video URL.')),
+      );
+      return;
+    }
 
     setState(() {
       _isExtracting = true;
@@ -1589,41 +1887,19 @@ class _ControllerScreenState extends State<ControllerScreen> {
     final List<StreamQualityOption> qualities = [];
 
     try {
-      // 1. Check if YouTube Video / Shorts URL
-      if (cleanUrl.contains('youtube.com/') || cleanUrl.contains('youtu.be/')) {
-        final ytExplode = yt.YoutubeExplode();
-        try {
-          final video = await ytExplode.videos.get(cleanUrl);
-          _extractedTitle = video.title;
-          final manifest = await ytExplode.videos.streamsClient.getManifest(video.id);
-
-          final muxed = manifest.muxed.sortByVideoQuality();
-          final Set<String> seenLabels = {};
-          for (final s in muxed) {
-            final label = s.qualityLabel;
-            if (!seenLabels.contains(label)) {
-              seenLabels.add(label);
-              qualities.add(StreamQualityOption(label: label, url: s.url.toString()));
-            }
-          }
-          // Also include HLS manifest if available
-          if (manifest.hls.isNotEmpty) {
-            qualities.add(StreamQualityOption(
-              label: 'Auto (HLS)',
-              url: manifest.hls.first.url.toString(),
-            ));
-          }
-        } finally {
-          ytExplode.close();
-        }
+      // 1. Check if input is a YouTube video / shorts / live / shared text
+      final ytId = _parseYouTubeVideoId(rawUrl);
+      if (ytId != null) {
+        final ytStreams = await _extractYouTubeStreams(ytId);
+        qualities.addAll(ytStreams);
       }
       // 2. Check if Instagram Reel / Post URL
       else if (cleanUrl.contains('instagram.com/')) {
         _extractedTitle = 'Instagram Video';
-        final igStreams = await _extractInstagramVideo(cleanUrl);
+        final igStreams = await _extractInstagramVideo(rawUrl);
         qualities.addAll(igStreams);
       }
-      // 3. Direct IPTV (.m3u8) or Direct Video Link (.mp4, .webm, .mkv)
+      // 3. Direct IPTV (.m3u8) or Direct Video Link (.mp4, .webm, .mkv, .mpd)
       else if (RegExp(r'\.(m3u8|mp4|webm|mkv|mpd)(\?.*)?$', caseSensitive: false).hasMatch(cleanUrl)) {
         final isHls = cleanUrl.toLowerCase().contains('.m3u8');
         _extractedTitle = isHls ? 'IPTV / HLS Stream' : 'Direct Video Stream';
@@ -1635,37 +1911,10 @@ class _ControllerScreenState extends State<ControllerScreen> {
           qualities.addAll(variants);
         }
       }
-      // 4. Generic Webpage Scraper (Extracts embedded .m3u8 / .mp4 + og:video)
+      // 4. Generic Webpage Scraper (Extracts embedded YouTube, HTML5 video, og:video)
       else {
-        final response = await http.get(
-          Uri.parse(cleanUrl),
-          headers: {
-            'User-Agent':
-                'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36',
-          },
-        );
-        if (response.statusCode == 200) {
-          final titleMatch = RegExp(r'<title>(.*?)</title>', caseSensitive: false).firstMatch(response.body);
-          if (titleMatch != null && titleMatch.group(1) != null) {
-            _extractedTitle = titleMatch.group(1)!.trim();
-          }
-          final body = response.body.replaceAll(r'\/', '/');
-          final urlRegex = RegExp(
-            r'''(https?://[^\s"'<>\\]+\.(?:m3u8|mp4|webm)(?:\?[^\s"'<>\\]*)?)''',
-            caseSensitive: false,
-          );
-          final Set<String> foundUrls = {};
-          for (final match in urlRegex.allMatches(body)) {
-            final u = match.group(0);
-            if (u != null && !foundUrls.contains(u)) {
-              foundUrls.add(u);
-              final label = u.contains('.m3u8')
-                  ? 'HLS Stream #${foundUrls.length}'
-                  : 'Direct MP4 #${foundUrls.length}';
-              qualities.add(StreamQualityOption(label: label, url: u));
-            }
-          }
-        }
+        final webStreams = await _scrapeWebpageVideos(cleanUrl);
+        qualities.addAll(webStreams);
       }
     } catch (e) {
       if (mounted) {
@@ -1682,53 +1931,24 @@ class _ControllerScreenState extends State<ControllerScreen> {
       }
       _isExtracting = false;
     });
-  }
 
-  Future<List<StreamQualityOption>> _extractInstagramVideo(String igUrl) async {
-    final List<StreamQualityOption> list = [];
-    final Set<String> urls = {};
-    try {
-      final cleanIgUrl = igUrl.split('?').first;
-      final embedUrl = cleanIgUrl.endsWith('/') ? '${cleanIgUrl}embed/captioned/' : '$cleanIgUrl/embed/captioned/';
-
-      for (final target in [igUrl, embedUrl]) {
-        final res = await http.get(
-          Uri.parse(target),
-          headers: {
-            'User-Agent':
-                'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
-          },
+    if (mounted) {
+      if (qualities.isEmpty) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('No playable streams found. Verify the URL or ensure the video is public.'),
+            backgroundColor: Colors.orangeAccent,
+          ),
         );
-        if (res.statusCode == 200) {
-          final decoded = res.body
-              .replaceAll(r'\/', '/')
-              .replaceAll(r'\u0026', '&')
-              .replaceAll('&amp;', '&');
-
-          // Check og:video meta tag and video_url JSON keys
-          final ogRegex = RegExp(r'property="og:video"\s+content="([^"]+)"');
-          final jsonVideoRegex = RegExp(r'"video_url"\s*:\s*"([^"]+)"');
-          final mp4Regex = RegExp(r'(https?://[^\s"<>\\]+\.mp4\?[^\s"<>\\]+)');
-
-          for (final m in [
-            ...ogRegex.allMatches(decoded),
-            ...jsonVideoRegex.allMatches(decoded),
-            ...mp4Regex.allMatches(decoded),
-          ]) {
-            final u = m.group(1);
-            if (u != null && u.startsWith('http') && !urls.contains(u)) {
-              urls.add(u);
-              list.add(StreamQualityOption(
-                label: list.isEmpty ? 'Instagram HD' : 'Instagram Stream #${list.length + 1}',
-                url: u,
-              ));
-            }
-          }
-        }
-        if (list.isNotEmpty) break;
+      } else {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Found ${qualities.length} stream quality option(s)! Ready to cast.'),
+            backgroundColor: Colors.teal,
+          ),
+        );
       }
-    } catch (_) {}
-    return list;
+    }
   }
 
   Future<List<StreamQualityOption>> _parseHlsMasterVariants(String masterUrl) async {
