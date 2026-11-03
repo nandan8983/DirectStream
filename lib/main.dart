@@ -424,7 +424,7 @@ class ModeSelectionScreen extends StatefulWidget {
 }
 
 class _ModeSelectionScreenState extends State<ModeSelectionScreen> {
-  String _versionLabel = 'v0.0.7';
+  String _versionLabel = 'v0.0.8';
 
   @override
   void initState() {
@@ -643,49 +643,100 @@ class _TvReceiverScreenState extends State<TvReceiverScreen> with WidgetsBinding
     _isForeground = (state == AppLifecycleState.resumed);
   }
 
-  Future<void> _initReceiverServices() async {
-    final prefs = await SharedPreferences.getInstance();
-    String? savedCode = prefs.getString('tv_room_code');
-    if (savedCode == null || savedCode.length != 6) {
-      savedCode = (100000 + Random().nextInt(899999)).toString();
-      await prefs.setString('tv_room_code', savedCode);
+  void _updatePairingState() {
+    _deviceName = 'DirectStream TV (${_localIp.split('.').last})';
+    _pairingQrData = jsonEncode({
+      'ws': 'ws://$_localIp:$kReceiverPort',
+      'room': _roomCode,
+      'name': _deviceName,
+      'ip': _localIp,
+    });
+    if (mounted) {
+      setState(() {});
     }
-    _roomCode = savedCode;
+  }
 
-    final bool hasOverlayPerm = await FlutterOverlayWindow.isPermissionGranted();
-    if (!hasOverlayPerm) {
-      await FlutterOverlayWindow.requestPermission();
-    }
+  /// Detects real local IP address (prioritizing NetworkInterface which doesn't need location perms)
+  Future<String?> _detectLocalIp() async {
+    // 1. NetworkInterface.list is primary (works on Android TV Wi-Fi & Ethernet cable)
+    try {
+      final interfaces = await NetworkInterface.list(
+        type: InternetAddressType.IPv4,
+        includeLoopback: false,
+      );
 
-    final info = NetworkInfo();
-    String? wifiIp = await info.getWifiIP();
-    if (wifiIp == null) {
-      final interfaces = await NetworkInterface.list(type: InternetAddressType.IPv4);
-      for (var interface in interfaces) {
-        for (var addr in interface.addresses) {
-          if (!addr.isLoopback) {
-            wifiIp = addr.address;
-            break;
+      // Prioritize private LAN addresses: 192.168.x.x, 10.x.x.x, 172.16-31.x.x
+      for (final iface in interfaces) {
+        for (final addr in iface.addresses) {
+          if (!addr.isLoopback && addr.type == InternetAddressType.IPv4) {
+            final ip = addr.address;
+            if (ip.startsWith('192.168.') || ip.startsWith('10.') || ip.startsWith('172.')) {
+              return ip;
+            }
           }
         }
       }
+
+      // Fallback: any non-loopback IPv4
+      for (final iface in interfaces) {
+        for (final addr in iface.addresses) {
+          if (!addr.isLoopback && addr.type == InternetAddressType.IPv4 && addr.address != '127.0.0.1') {
+            return addr.address;
+          }
+        }
+      }
+    } catch (_) {}
+
+    // 2. Fallback to network_info_plus with try-catch
+    try {
+      final info = NetworkInfo();
+      final wifiIp = await info.getWifiIP().timeout(const Duration(seconds: 2));
+      if (wifiIp != null && wifiIp.isNotEmpty && wifiIp != '127.0.0.1') {
+        return wifiIp;
+      }
+    } catch (_) {}
+
+    return null;
+  }
+
+  Future<void> _initReceiverServices() async {
+    // 1. Instantly read/generate 6-digit room code and show it on TV UI immediately!
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      String? savedCode = prefs.getString('tv_room_code');
+      if (savedCode == null || savedCode.length != 6) {
+        savedCode = (100000 + Random().nextInt(899999)).toString();
+        await prefs.setString('tv_room_code', savedCode);
+      }
+      _roomCode = savedCode;
+    } catch (_) {
+      _roomCode = (100000 + Random().nextInt(899999)).toString();
     }
-    _localIp = wifiIp ?? '127.0.0.1';
-    _deviceName = 'DirectStream TV (${_localIp.split('.').last})';
+    _updatePairingState(); // Instantly updates pairing code on TV screen!
 
-    // Encode BOTH Local WebSocket IP and Router-Bypass Room Code in QR
-    setState(() {
-      _pairingQrData = jsonEncode({
-        'ws': 'ws://$_localIp:$kReceiverPort',
-        'room': _roomCode,
-        'name': _deviceName,
-        'ip': _localIp,
-      });
-    });
+    // 2. Safe, non-blocking overlay check with timeout (will not hang or crash on Android TV)
+    try {
+      final bool hasOverlayPerm = await FlutterOverlayWindow.isPermissionGranted()
+          .timeout(const Duration(milliseconds: 600), onTimeout: () => false);
+      if (!hasOverlayPerm) {
+        await FlutterOverlayWindow.requestPermission()
+            .timeout(const Duration(milliseconds: 800), onTimeout: () => false);
+      }
+    } catch (_) {}
 
+    // 3. Detect Real IP (Ethernet cable or Wi-Fi)
+    final detectedIp = await _detectLocalIp();
+    if (detectedIp != null && detectedIp.isNotEmpty) {
+      _localIp = detectedIp;
+    }
+    _updatePairingState(); // Instantly updates IP address and QR code!
+
+    // 4. Start Local LAN Servers
     await _startHttpAndWebSocketServer();
     await _startUdpDiscoveryResponder();
-    await _connectMqttRelay();
+
+    // 5. Connect to MQTT Relay in background (non-blocking)
+    _connectMqttRelay();
   }
 
   Future<void> _startHttpAndWebSocketServer() async {
@@ -775,7 +826,7 @@ class _TvReceiverScreenState extends State<TvReceiverScreen> with WidgetsBinding
     };
 
     try {
-      await client.connect();
+      await client.connect().timeout(const Duration(seconds: 5));
       _mqttClient = client;
       client.updates?.listen((List<MqttReceivedMessage<MqttMessage?>>? c) {
         if (c == null || c.isEmpty) return;
@@ -802,11 +853,13 @@ class _TvReceiverScreenState extends State<TvReceiverScreen> with WidgetsBinding
   }
 
   void _listenToOverlayEvents() {
-    FlutterOverlayWindow.overlayListener.listen((event) {
-      if (event is Map && event['action'] == 'ACCEPT') {
-        _startVideoPlayback(event['url'], title: event['title'] ?? 'Stream');
-      }
-    });
+    try {
+      FlutterOverlayWindow.overlayListener.listen((event) {
+        if (event is Map && event['action'] == 'ACCEPT') {
+          _startVideoPlayback(event['url'], title: event['title'] ?? 'Stream');
+        }
+      }, onError: (_) {});
+    } catch (_) {}
   }
 
   Future<void> _handleControllerPayload(Map<String, dynamic> payload) async {
@@ -1082,6 +1135,16 @@ class _TvReceiverScreenState extends State<TvReceiverScreen> with WidgetsBinding
       appBar: AppBar(
         title: Text(_deviceName),
         actions: [
+          IconButton(
+            icon: const Icon(Icons.refresh, color: Colors.tealAccent),
+            tooltip: 'Refresh Network & IP',
+            onPressed: () {
+              _initReceiverServices();
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(content: Text('Refreshing network & pairing details...'), duration: Duration(seconds: 1)),
+              );
+            },
+          ),
           IconButton(
             icon: const Icon(Icons.system_update, color: Colors.tealAccent),
             tooltip: 'Check GitHub for Update',
