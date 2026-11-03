@@ -424,7 +424,7 @@ class ModeSelectionScreen extends StatefulWidget {
 }
 
 class _ModeSelectionScreenState extends State<ModeSelectionScreen> {
-  String _versionLabel = 'v0.0.4';
+  String _versionLabel = 'v0.0.5';
 
   @override
   void initState() {

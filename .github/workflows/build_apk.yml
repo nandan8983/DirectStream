@@ -31,11 +31,10 @@ jobs:
         id: version
         run: |
           RAW=$(grep '^version:' pubspec.yaml | sed 's/version://' | tr -d ' \r\n')
-          echo "VERSION=$RAW"       >> $GITHUB_OUTPUT
-          echo "TAG=v$RAW"          >> $GITHUB_OUTPUT
-          # Build number is the part after '+'
+          echo "VERSION=$RAW"  >> $GITHUB_OUTPUT
+          echo "TAG=v$RAW"     >> $GITHUB_OUTPUT
           BUILD=$(echo "$RAW" | cut -d'+' -f2)
-          echo "BUILD=$BUILD"       >> $GITHUB_OUTPUT
+          echo "BUILD=$BUILD"  >> $GITHUB_OUTPUT
           echo "Detected version: $RAW  tag: v$RAW  build: $BUILD"
 
       # -----------------------------------------------------------------------
@@ -54,7 +53,7 @@ jobs:
           cache: true
 
       # -----------------------------------------------------------------------
-      # 4. Bootstrap Android scaffolding (creates android/ folder if absent)
+      # 4. Bootstrap Android scaffolding (creates android/ folder)
       # -----------------------------------------------------------------------
       - name: Initialize Android scaffolding
         run: |
@@ -62,36 +61,50 @@ jobs:
           cp android_manifest_template.xml android/app/src/main/AndroidManifest.xml
 
       # -----------------------------------------------------------------------
-      # 5. Install Dart/Flutter dependencies
+      # 5. Configure RELEASE SIGNING so every build has the same signature.
+      #    Without this, Android refuses OTA updates with "package conflict".
+      #
+      #    The keystore/directstream.jks file is committed to the repo —
+      #    this is safe for a non-Play-Store sideloaded app.
+      # -----------------------------------------------------------------------
+      - name: Configure release signing
+        run: |
+          # Copy key.properties where Gradle expects it (android/ root)
+          cp keystore/key.properties android/key.properties
+          # Run the shared patch script
+          python3 patch_gradle.py
+
+      # -----------------------------------------------------------------------
+      # 6. Install Dart/Flutter dependencies
       # -----------------------------------------------------------------------
       - name: Install dependencies
         run: flutter pub get
 
       # -----------------------------------------------------------------------
-      # 6. Generate launcher icons (reads pubspec flutter_launcher_icons section)
+      # 7. Generate launcher icons
       # -----------------------------------------------------------------------
       - name: Generate app launcher icons
         run: dart run flutter_launcher_icons
 
       # -----------------------------------------------------------------------
-      # 7. Build a RELEASE APK (smaller, faster, suitable for distribution)
+      # 8. Build a signed RELEASE APK
       # -----------------------------------------------------------------------
-      - name: Build release APK
+      - name: Build signed release APK
         run: flutter build apk --release
 
       # -----------------------------------------------------------------------
-      # 8. Rename APK so the asset filename contains the version tag
+      # 9. Rename APK to include version tag
       # -----------------------------------------------------------------------
-      - name: Rename APK to versioned filename
+      - name: Rename APK
         run: |
           mkdir -p dist
           cp build/app/outputs/flutter-apk/app-release.apk \
              dist/DirectStream-${{ steps.version.outputs.TAG }}.apk
           echo "APK ready: dist/DirectStream-${{ steps.version.outputs.TAG }}.apk"
+          ls -lh dist/
 
       # -----------------------------------------------------------------------
-      # 9. Delete any pre-existing release+tag with the same name so we can
-      #    overwrite it on a re-push of the same version.
+      # 10. Delete any pre-existing release+tag so we can re-release same version
       # -----------------------------------------------------------------------
       - name: Delete existing release and tag (if any)
         continue-on-error: true
@@ -102,9 +115,8 @@ jobs:
           git push origin ":refs/tags/${{ steps.version.outputs.TAG }}" 2>/dev/null || true
 
       # -----------------------------------------------------------------------
-      # 10. Create a proper GitHub Release with the APK as a downloadable asset.
-      #     The in-app auto-updater calls /releases/latest and looks for a
-      #     .apk asset — this step makes that work.
+      # 11. Publish GitHub Release with the APK as a downloadable asset
+      #     The in-app auto-updater checks /releases/latest for this.
       # -----------------------------------------------------------------------
       - name: Create GitHub Release and upload APK
         uses: softprops/action-gh-release@v2
@@ -114,17 +126,14 @@ jobs:
           body: |
             ## DirectStream ${{ steps.version.outputs.TAG }}
 
-            Auto-built release from commit `${{ github.sha }}`
-
-            ### What's new
-            See the commit history for details.
+            Auto-built and signed release from commit `${{ github.sha }}`
 
             ### How to install / update
             1. Download **DirectStream-${{ steps.version.outputs.TAG }}.apk** below.
             2. On your Android device → Settings → **Install unknown apps** → allow your browser/file manager.
             3. Open the downloaded APK and tap **Install**.
 
-            > The in-app **Check Update** button will detect this release automatically.
+            > **Existing users:** The in-app **Check Update** button detects this release automatically and installs it over the existing app (same signing key — no uninstall needed).
           files: dist/DirectStream-${{ steps.version.outputs.TAG }}.apk
           make_latest: true
           fail_on_unmatched_files: true
