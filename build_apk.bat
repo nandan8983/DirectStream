@@ -13,9 +13,13 @@ copy /Y android_manifest_template.xml android\app\src\main\AndroidManifest.xml
 if errorlevel 1 goto :error
 copy /Y keystore\key.properties android\key.properties
 if errorlevel 1 goto :error
+copy /Y keystore\directstream.jks android\directstream.jks
+if errorlevel 1 goto :error
+copy /Y keystore\directstream.jks android\app\directstream.jks
+if errorlevel 1 goto :error
 
 echo.
-echo [3/5] Patching build.gradle for release signing...
+echo [3/5] Patching build.gradle / build.gradle.kts for release signing...
 python patch_gradle.py
 if errorlevel 1 goto :error
 

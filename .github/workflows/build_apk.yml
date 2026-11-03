@@ -57,6 +57,7 @@ jobs:
       # -----------------------------------------------------------------------
       - name: Initialize Android scaffolding
         run: |
+          rm -rf android
           flutter create . --project-name tv_cast_app --platforms=android
           cp android_manifest_template.xml android/app/src/main/AndroidManifest.xml
 
@@ -71,7 +72,10 @@ jobs:
         run: |
           # Copy key.properties where Gradle expects it (android/ root)
           cp keystore/key.properties android/key.properties
-          # Run the shared patch script
+          # Copy keystore into both android/ and android/app/ for foolproof path resolution
+          cp keystore/directstream.jks android/directstream.jks
+          cp keystore/directstream.jks android/app/directstream.jks
+          # Run the shared patch script (supports both build.gradle.kts and build.gradle)
           python3 patch_gradle.py
 
       # -----------------------------------------------------------------------
