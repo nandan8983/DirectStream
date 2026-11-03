@@ -424,7 +424,7 @@ class ModeSelectionScreen extends StatefulWidget {
 }
 
 class _ModeSelectionScreenState extends State<ModeSelectionScreen> {
-  String _versionLabel = 'v0.0.5';
+  String _versionLabel = 'v0.0.6';
 
   @override
   void initState() {
@@ -607,6 +607,28 @@ class _TvReceiverScreenState extends State<TvReceiverScreen> with WidgetsBinding
   double _currentSpeed = 1.0;
   String _currentQualityLabel = 'Auto';
   List<StreamQualityOption> _availableQualities = [];
+  bool _showOverlayControls = true;
+  Timer? _controlsTimer;
+
+  void _scheduleControlsAutoHide() {
+    _controlsTimer?.cancel();
+    _controlsTimer = Timer(const Duration(seconds: 4), () {
+      if (mounted && _showOverlayControls) {
+        setState(() {
+          _showOverlayControls = false;
+        });
+      }
+    });
+  }
+
+  void _revealControls() {
+    if (!_showOverlayControls) {
+      setState(() {
+        _showOverlayControls = true;
+      });
+    }
+    _scheduleControlsAutoHide();
+  }
 
   @override
   void initState() {
@@ -895,6 +917,8 @@ class _TvReceiverScreenState extends State<TvReceiverScreen> with WidgetsBinding
         playbackSpeeds: const [0.5, 0.75, 1.0, 1.25, 1.5, 2.0],
         showControlsOnInitialize: false,
       );
+      _showOverlayControls = true;
+      _scheduleControlsAutoHide();
       if (mounted) setState(() {});
     } catch (e) {
       if (mounted) {
@@ -906,7 +930,8 @@ class _TvReceiverScreenState extends State<TvReceiverScreen> with WidgetsBinding
     }
   }
 
-  void _openTvSpeedAndQualitySheet() {
+  Future<void> _openTvSpeedAndQualitySheet() async {
+    _controlsTimer?.cancel();
     showModalBottomSheet(
       context: context,
       backgroundColor: const Color(0xFF16222D),
@@ -957,9 +982,15 @@ class _TvReceiverScreenState extends State<TvReceiverScreen> with WidgetsBinding
         ),
       ),
     );
+    if (mounted) {
+      _revealControls();
+    }
   }
 
   void _disposePlayer() {
+    _controlsTimer?.cancel();
+    _controlsTimer = null;
+    _showOverlayControls = true;
     _chewieController?.dispose();
     _videoController?.dispose();
     _chewieController = null;
@@ -984,38 +1015,65 @@ class _TvReceiverScreenState extends State<TvReceiverScreen> with WidgetsBinding
     if (_currentStreamUrl != null && _chewieController != null) {
       return Scaffold(
         backgroundColor: Colors.black,
-        body: Stack(
-          children: [
-            Center(child: Chewie(controller: _chewieController!)),
-            Positioned(
-              top: 24,
-              left: 24,
-              right: 24,
-              child: Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        body: Focus(
+          autofocus: true,
+          onKeyEvent: (node, event) {
+            _revealControls();
+            return KeyEventResult.ignored;
+          },
+          child: MouseRegion(
+            onHover: (_) => _revealControls(),
+            child: GestureDetector(
+              behavior: HitTestBehavior.translucent,
+              onTap: () {
+                if (_showOverlayControls) {
+                  _scheduleControlsAutoHide();
+                } else {
+                  _revealControls();
+                }
+              },
+              child: Stack(
                 children: [
-                  ElevatedButton.icon(
-                    onPressed: () {
-                      _disposePlayer();
-                      setState(() => _currentStreamUrl = null);
-                    },
-                    icon: const Icon(Icons.arrow_back),
-                    label: const Text('Exit Stream'),
-                  ),
-                  Row(
-                    children: [
-                      ElevatedButton.icon(
-                        autofocus: true,
-                        onPressed: _openTvSpeedAndQualitySheet,
-                        icon: const Icon(Icons.tune, color: Colors.tealAccent),
-                        label: Text('Speed (${_currentSpeed}x) & Quality ($_currentQualityLabel)'),
+                  Center(child: Chewie(controller: _chewieController!)),
+                  Positioned(
+                    top: 24,
+                    left: 24,
+                    right: 24,
+                    child: AnimatedOpacity(
+                      opacity: _showOverlayControls ? 1.0 : 0.0,
+                      duration: const Duration(milliseconds: 300),
+                      child: IgnorePointer(
+                        ignoring: !_showOverlayControls,
+                        child: Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            ElevatedButton.icon(
+                              onPressed: () {
+                                _disposePlayer();
+                                setState(() => _currentStreamUrl = null);
+                              },
+                              icon: const Icon(Icons.arrow_back),
+                              label: const Text('Exit Stream'),
+                            ),
+                            Row(
+                              children: [
+                                ElevatedButton.icon(
+                                  autofocus: false,
+                                  onPressed: _openTvSpeedAndQualitySheet,
+                                  icon: const Icon(Icons.tune, color: Colors.tealAccent),
+                                  label: Text('Speed (${_currentSpeed}x) & Quality ($_currentQualityLabel)'),
+                                ),
+                              ],
+                            ),
+                          ],
+                        ),
                       ),
-                    ],
+                    ),
                   ),
                 ],
               ),
             ),
-          ],
+          ),
         ),
       );
     }
