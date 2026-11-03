@@ -1,7 +1,7 @@
 name: tv_cast_app
-description: Dual-mode TV Receiver & Mobile Controller Cast App with GitHub Auto-Updater
+description: Dual-mode TV Receiver & Mobile Controller Cast App (v0.04)
 publish_to: 'none'
-version: 0.0.3+3
+version: 0.0.4+4
 
 environment:
   sdk: '>=3.2.0 <4.0.0'
@@ -20,6 +20,9 @@ dependencies:
   package_info_plus: ^8.0.0
   path_provider: ^2.1.2
   open_filex: ^4.4.0
+  shared_preferences: ^2.2.2
+  youtube_explode_dart: ^2.2.1
+  mqtt_client: ^10.2.0
 
 dev_dependencies:
   flutter_test:

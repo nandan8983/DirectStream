@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
@@ -13,8 +14,15 @@ import 'package:flutter_overlay_window/flutter_overlay_window.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:open_filex/open_filex.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:youtube_explode_dart/youtube_explode_dart.dart' as yt;
+import 'package:mqtt_client/mqtt_client.dart';
+import 'package:mqtt_client/mqtt_server_client.dart';
 
 const String kGithubRepo = 'nandan8983/DirectStream';
+const int kReceiverPort = 8080;
+const int kDiscoveryUdpPort = 45454;
+const String kMqttBroker = 'broker.emqx.io';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -31,7 +39,76 @@ void overlayMain() {
 }
 
 // ============================================================================
-// GITHUB AUTO-UPDATER SERVICE (Checks nandan8983/DirectStream Releases)
+// DATA MODELS (Stream Quality, Discovered TV, Playback History)
+// ============================================================================
+class StreamQualityOption {
+  final String label; // e.g., "1080p", "720p", "360p", "Auto (HLS)"
+  final String url;
+
+  StreamQualityOption({required this.label, required this.url});
+
+  Map<String, dynamic> toJson() => {'label': label, 'url': url};
+  factory StreamQualityOption.fromJson(Map<String, dynamic> json) =>
+      StreamQualityOption(label: json['label'] ?? 'Auto', url: json['url'] ?? '');
+}
+
+class DiscoveredReceiver {
+  final String name;
+  final String ip;
+  final int port;
+  final String roomCode;
+  final String mode; // 'LAN' or 'Router-Bypass'
+
+  DiscoveredReceiver({
+    required this.name,
+    required this.ip,
+    required this.port,
+    required this.roomCode,
+    this.mode = 'LAN',
+  });
+
+  String get wsUrl => 'ws://$ip:$port';
+}
+
+class PlaybackHistoryItem {
+  final String title;
+  final String originalUrl;
+  final String streamUrl;
+  final List<StreamQualityOption> qualities;
+  final String timestamp;
+
+  PlaybackHistoryItem({
+    required this.title,
+    required this.originalUrl,
+    required this.streamUrl,
+    required this.qualities,
+    required this.timestamp,
+  });
+
+  Map<String, dynamic> toJson() => {
+        'title': title,
+        'originalUrl': originalUrl,
+        'streamUrl': streamUrl,
+        'qualities': qualities.map((q) => q.toJson()).toList(),
+        'timestamp': timestamp,
+      };
+
+  factory PlaybackHistoryItem.fromJson(Map<String, dynamic> json) {
+    final rawQualities = (json['qualities'] as List?) ?? [];
+    return PlaybackHistoryItem(
+      title: json['title'] ?? 'Video Stream',
+      originalUrl: json['originalUrl'] ?? '',
+      streamUrl: json['streamUrl'] ?? '',
+      qualities: rawQualities
+          .map((q) => StreamQualityOption.fromJson(Map<String, dynamic>.from(q)))
+          .toList(),
+      timestamp: json['timestamp'] ?? '',
+    );
+  }
+}
+
+// ============================================================================
+// GITHUB AUTO-UPDATER SERVICE
 // ============================================================================
 class GitHubAutoUpdater {
   static Future<void> checkForUpdate(BuildContext context, {bool silentIfUpToDate = true}) async {
@@ -55,10 +132,9 @@ class GitHubAutoUpdater {
       }
 
       final Map<String, dynamic> release = jsonDecode(response.body);
-      final String tagName = (release['tag_name'] ?? '').toString(); // e.g. "v0.0.4+4" or "v0.0.3-build5"
+      final String tagName = (release['tag_name'] ?? '').toString();
       final String releaseNotes = (release['body'] ?? 'New version compiled via GitHub Actions.').toString();
 
-      // Extract build number from tag (format: v0.0.3+4 or v0.0.3-4)
       int remoteBuild = currentBuild;
       final RegExp buildRegex = RegExp(r'[+\-](\d+)$');
       final Match? buildMatch = buildRegex.firstMatch(tagName);
@@ -78,7 +154,6 @@ class GitHubAutoUpdater {
         return;
       }
 
-      // Find the .apk asset download URL inside the latest GitHub Release
       String? apkDownloadUrl;
       final List<dynamic> assets = release['assets'] ?? [];
       for (final asset in assets) {
@@ -176,16 +251,12 @@ class GitHubAutoUpdater {
                           if (totalBytes > 0) {
                             setDialogState(() {
                               progress = receivedBytes / totalBytes;
-                              statusText =
-                                  'Downloading: ${(progress * 100).toStringAsFixed(0)}%';
+                              statusText = 'Downloading: ${(progress * 100).toStringAsFixed(0)}%';
                             });
                           }
                         }
                         await sink.close();
 
-                        setDialogState(() {
-                          statusText = 'Launching installer...';
-                        });
                         if (ctx.mounted) Navigator.pop(ctx);
                         await OpenFilex.open(apkFile.path);
                       } catch (e) {
@@ -205,6 +276,9 @@ class GitHubAutoUpdater {
   }
 }
 
+// ============================================================================
+// APP ROOT & MODE SELECTION
+// ============================================================================
 class DirectStreamApp extends StatelessWidget {
   const DirectStreamApp({super.key});
 
@@ -239,13 +313,12 @@ class ModeSelectionScreen extends StatefulWidget {
 }
 
 class _ModeSelectionScreenState extends State<ModeSelectionScreen> {
-  String _versionLabel = 'v0.0.3';
+  String _versionLabel = 'v0.0.4';
 
   @override
   void initState() {
     super.initState();
     _loadPackageVersion();
-    // Automatically check GitHub Releases on launch
     WidgetsBinding.instance.addPostFrameCallback((_) {
       GitHubAutoUpdater.checkForUpdate(context, silentIfUpToDate: true);
     });
@@ -283,7 +356,6 @@ class _ModeSelectionScreenState extends State<ModeSelectionScreen> {
             child: Column(
               mainAxisAlignment: MainAxisAlignment.center,
               children: [
-                // Custom App Logo Widget
                 Container(
                   width: 96,
                   height: 96,
@@ -291,13 +363,6 @@ class _ModeSelectionScreenState extends State<ModeSelectionScreen> {
                     color: const Color(0xFF16222D),
                     borderRadius: BorderRadius.circular(24),
                     border: Border.all(color: Colors.tealAccent.withOpacity(0.5), width: 2),
-                    boxShadow: [
-                      BoxShadow(
-                        color: Colors.tealAccent.withOpacity(0.15),
-                        blurRadius: 20,
-                        spreadRadius: 2,
-                      ),
-                    ],
                   ),
                   child: const Stack(
                     alignment: Alignment.center,
@@ -317,7 +382,7 @@ class _ModeSelectionScreenState extends State<ModeSelectionScreen> {
                 ),
                 const SizedBox(height: 4),
                 Text(
-                  'GitHub Auto-Update Enabled • $_versionLabel',
+                  'Wi-Fi Discovery • Router Bypass • YT/IG ($_versionLabel)',
                   style: const TextStyle(color: Colors.tealAccent, fontSize: 13),
                 ),
                 const SizedBox(height: 32),
@@ -325,7 +390,7 @@ class _ModeSelectionScreenState extends State<ModeSelectionScreen> {
                   autofocus: true,
                   icon: Icons.tv,
                   title: 'TV Receiver Mode',
-                  subtitle: 'Displays QR code, listens in background & plays streams',
+                  subtitle: 'Broadcasts on Wi-Fi + Cloud Relay, plays YouTube/IG/IPTV with Speed & Quality controls',
                   onTap: () => Navigator.pushReplacement(
                     context,
                     MaterialPageRoute(builder: (_) => const TvReceiverScreen()),
@@ -336,7 +401,7 @@ class _ModeSelectionScreenState extends State<ModeSelectionScreen> {
                   autofocus: false,
                   icon: Icons.smartphone,
                   title: 'Phone Controller Mode',
-                  subtitle: 'Extracts embedded/IPTV URLs and casts to TV',
+                  subtitle: 'Auto-discovers TVs on Wi-Fi, saves Playback History, controls Speed & Quality',
                   onTap: () => Navigator.pushReplacement(
                     context,
                     MaterialPageRoute(builder: (_) => const ControllerScreen()),
@@ -401,6 +466,9 @@ class _RoleCard extends StatelessWidget {
   }
 }
 
+// ============================================================================
+// TV RECEIVER MODE (HTTP/WS + UDP Discovery + MQTT Router-Isolation Bypass)
+// ============================================================================
 class TvReceiverScreen extends StatefulWidget {
   const TvReceiverScreen({super.key});
 
@@ -410,20 +478,30 @@ class TvReceiverScreen extends StatefulWidget {
 
 class _TvReceiverScreenState extends State<TvReceiverScreen> with WidgetsBindingObserver {
   HttpServer? _server;
+  RawDatagramSocket? _udpSocket;
+  MqttServerClient? _mqttClient;
   final List<WebSocket> _sockets = [];
-  String _pairingAddress = 'Fetching IP...';
+
+  String _localIp = '127.0.0.1';
+  String _pairingQrData = 'Initializing...';
+  String _roomCode = '------';
+  String _deviceName = 'DirectStream TV';
+  bool _mqttConnected = false;
   bool _isForeground = true;
-  final int _port = 8080;
 
   VideoPlayerController? _videoController;
   ChewieController? _chewieController;
   String? _currentStreamUrl;
+  String _currentTitle = 'Stream';
+  double _currentSpeed = 1.0;
+  String _currentQualityLabel = 'Auto';
+  List<StreamQualityOption> _availableQualities = [];
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    _initReceiverServer();
+    _initReceiverServices();
     _listenToOverlayEvents();
   }
 
@@ -432,7 +510,15 @@ class _TvReceiverScreenState extends State<TvReceiverScreen> with WidgetsBinding
     _isForeground = (state == AppLifecycleState.resumed);
   }
 
-  Future<void> _initReceiverServer() async {
+  Future<void> _initReceiverServices() async {
+    final prefs = await SharedPreferences.getInstance();
+    String? savedCode = prefs.getString('tv_room_code');
+    if (savedCode == null || savedCode.length != 6) {
+      savedCode = (100000 + Random().nextInt(899999)).toString();
+      await prefs.setString('tv_room_code', savedCode);
+    }
+    _roomCode = savedCode;
+
     final bool hasOverlayPerm = await FlutterOverlayWindow.isPermissionGranted();
     if (!hasOverlayPerm) {
       await FlutterOverlayWindow.requestPermission();
@@ -440,7 +526,6 @@ class _TvReceiverScreenState extends State<TvReceiverScreen> with WidgetsBinding
 
     final info = NetworkInfo();
     String? wifiIp = await info.getWifiIP();
-
     if (wifiIp == null) {
       final interfaces = await NetworkInterface.list(type: InternetAddressType.IPv4);
       for (var interface in interfaces) {
@@ -452,29 +537,141 @@ class _TvReceiverScreenState extends State<TvReceiverScreen> with WidgetsBinding
         }
       }
     }
+    _localIp = wifiIp ?? '127.0.0.1';
+    _deviceName = 'DirectStream TV (${_localIp.split('.').last})';
 
-    _server = await HttpServer.bind(InternetAddress.anyIPv4, _port);
+    // Encode BOTH Local WebSocket IP and Router-Bypass Room Code in QR
     setState(() {
-      _pairingAddress = 'ws://${wifiIp ?? "127.0.0.1"}:$_port';
+      _pairingQrData = jsonEncode({
+        'ws': 'ws://$_localIp:$kReceiverPort',
+        'room': _roomCode,
+        'name': _deviceName,
+        'ip': _localIp,
+      });
     });
 
-    _server!.transform(WebSocketTransformer()).listen((WebSocket ws) {
-      _sockets.add(ws);
-      setState(() {});
-      ws.listen(
-        (data) => _handleControllerPayload(jsonDecode(data)),
-        onDone: () {
-          _sockets.remove(ws);
-          if (mounted) setState(() {});
-        },
-      );
-    });
+    await _startHttpAndWebSocketServer();
+    await _startUdpDiscoveryResponder();
+    await _connectMqttRelay();
+  }
+
+  Future<void> _startHttpAndWebSocketServer() async {
+    try {
+      _server = await HttpServer.bind(InternetAddress.anyIPv4, kReceiverPort, shared: true);
+      _server!.listen((HttpRequest req) {
+        // 1. Discovery endpoint for Wi-Fi Subnet Scanner
+        if (req.uri.path == '/discover') {
+          req.response.headers.contentType = ContentType.json;
+          req.response.headers.add('Access-Control-Allow-Origin', '*');
+          req.response.write(jsonEncode({
+            'app': 'DirectStream',
+            'name': _deviceName,
+            'ip': _localIp,
+            'port': kReceiverPort,
+            'room': _roomCode,
+          }));
+          req.response.close();
+          return;
+        }
+        // 2. WebSocket Upgrade for Direct LAN Control
+        if (WebSocketTransformer.isUpgradeRequest(req)) {
+          WebSocketTransformer.upgrade(req).then((WebSocket ws) {
+            _sockets.add(ws);
+            if (mounted) setState(() {});
+            ws.listen(
+              (data) => _handleControllerPayload(jsonDecode(data)),
+              onDone: () {
+                _sockets.remove(ws);
+                if (mounted) setState(() {});
+              },
+            );
+          });
+        } else {
+          req.response.statusCode = HttpStatus.ok;
+          req.response.write('DirectStream TV Receiver Active ($_deviceName)');
+          req.response.close();
+        }
+      });
+    } catch (_) {}
+  }
+
+  Future<void> _startUdpDiscoveryResponder() async {
+    try {
+      _udpSocket = await RawDatagramSocket.bind(InternetAddress.anyIPv4, kDiscoveryUdpPort);
+      _udpSocket!.broadcastEnabled = true;
+      _udpSocket!.listen((RawSocketEvent event) {
+        if (event == RawSocketEvent.read) {
+          final dg = _udpSocket!.receive();
+          if (dg == null) return;
+          final msg = utf8.decode(dg.data).trim();
+          if (msg == 'DIRECTSTREAM_DISCOVER') {
+            final reply = utf8.encode(jsonEncode({
+              'app': 'DirectStream',
+              'name': _deviceName,
+              'ip': _localIp,
+              'port': kReceiverPort,
+              'room': _roomCode,
+            }));
+            _udpSocket!.send(reply, dg.address, dg.port);
+          }
+        }
+      });
+    } catch (_) {}
+  }
+
+  /// Connects to MQTT Broker so even if the Wi-Fi router has AP Isolation enabled,
+  /// the phone can still discover and control the TV instantaneously!
+  Future<void> _connectMqttRelay() async {
+    final clientId = 'ds_tv_${_roomCode}_${Random().nextInt(9999)}';
+    final client = MqttServerClient(kMqttBroker, clientId);
+    client.port = 1883;
+    client.keepAlivePeriod = 30;
+    client.autoReconnect = true;
+    client.logging(on: false);
+
+    client.onConnected = () {
+      if (mounted) setState(() => _mqttConnected = true);
+      final cmdTopic = 'directstream/room/$_roomCode/cmd';
+      client.subscribe(cmdTopic, MqttQos.atLeastOnce);
+
+      // Also subscribe to global discovery topic for same-router devices
+      client.subscribe('directstream/lan/discover', MqttQos.atMostOnce);
+    };
+    client.onDisconnected = () {
+      if (mounted) setState(() => _mqttConnected = false);
+    };
+
+    try {
+      await client.connect();
+      _mqttClient = client;
+      client.updates?.listen((List<MqttReceivedMessage<MqttMessage?>>? c) {
+        if (c == null || c.isEmpty) return;
+        final recMess = c[0].payload as MqttPublishMessage;
+        final topic = c[0].topic;
+        final payloadStr = MqttPublishPayload.bytesToStringAsString(recMess.payload.message);
+
+        if (topic == 'directstream/lan/discover') {
+          // Reply with our TV details so the phone's Wi-Fi scanner sees us even across AP Isolation
+          final builder = MqttClientPayloadBuilder();
+          builder.addString(jsonEncode({
+            'app': 'DirectStream',
+            'name': _deviceName,
+            'ip': _localIp,
+            'port': kReceiverPort,
+            'room': _roomCode,
+          }));
+          client.publishMessage('directstream/lan/announce', MqttQos.atMostOnce, builder.payload!);
+        } else {
+          _handleControllerPayload(jsonDecode(payloadStr));
+        }
+      });
+    } catch (_) {}
   }
 
   void _listenToOverlayEvents() {
     FlutterOverlayWindow.overlayListener.listen((event) {
       if (event is Map && event['action'] == 'ACCEPT') {
-        _startVideoPlayback(event['url']);
+        _startVideoPlayback(event['url'], title: event['title'] ?? 'Stream');
       }
     });
   }
@@ -484,8 +681,16 @@ class _TvReceiverScreenState extends State<TvReceiverScreen> with WidgetsBinding
     final String? url = payload['url'];
 
     if (cmd == 'PLAY' && url != null) {
+      final String title = payload['title'] ?? 'Video Stream';
+      final String qualityLabel = payload['qualityLabel'] ?? 'Auto';
+      final List<dynamic> rawQualities = payload['qualities'] ?? [];
+      _availableQualities = rawQualities
+          .map((q) => StreamQualityOption.fromJson(Map<String, dynamic>.from(q)))
+          .toList();
+      _currentQualityLabel = qualityLabel;
+
       if (_isForeground) {
-        _startVideoPlayback(url);
+        _startVideoPlayback(url, title: title);
       } else {
         final bool canOverlay = await FlutterOverlayWindow.isPermissionGranted();
         if (canOverlay) {
@@ -495,27 +700,47 @@ class _TvReceiverScreenState extends State<TvReceiverScreen> with WidgetsBinding
             width: 550,
             alignment: OverlayAlignment.bottomRight,
           );
-          await FlutterOverlayWindow.shareData({'url': url});
+          await FlutterOverlayWindow.shareData({'url': url, 'title': title});
         } else {
-          _showAcceptRejectDialog(url);
+          _showAcceptRejectDialog(url, title);
         }
       }
     } else if (cmd == 'PAUSE') {
       _videoController?.pause();
+      if (mounted) setState(() {});
     } else if (cmd == 'RESUME') {
       _videoController?.play();
+      if (mounted) setState(() {});
     } else if (cmd == 'STOP') {
       _disposePlayer();
       setState(() => _currentStreamUrl = null);
+    } else if (cmd == 'SPEED') {
+      final double speed = (payload['speed'] as num?)?.toDouble() ?? 1.0;
+      _setPlaybackSpeed(speed);
+    } else if (cmd == 'QUALITY' && url != null) {
+      final String label = payload['qualityLabel'] ?? 'Auto';
+      _switchStreamQuality(url, label);
     }
   }
 
-  void _showAcceptRejectDialog(String url) {
+  Future<void> _setPlaybackSpeed(double speed) async {
+    _currentSpeed = speed;
+    await _videoController?.setPlaybackSpeed(speed);
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _switchStreamQuality(String newUrl, String label) async {
+    final Duration currentPos = _videoController?.value.position ?? Duration.zero;
+    _currentQualityLabel = label;
+    await _startVideoPlayback(newUrl, title: _currentTitle, startAt: currentPos);
+  }
+
+  void _showAcceptRejectDialog(String url, String title) {
     showDialog(
       context: context,
       barrierDismissible: false,
       builder: (ctx) => AlertDialog(
-        title: const Text('Incoming Stream Request'),
+        title: Text('Incoming Stream: $title'),
         content: Text('Play incoming stream on TV?\n\n$url', maxLines: 3, overflow: TextOverflow.ellipsis),
         actions: [
           TextButton(
@@ -526,7 +751,7 @@ class _TvReceiverScreenState extends State<TvReceiverScreen> with WidgetsBinding
             autofocus: true,
             onPressed: () {
               Navigator.pop(ctx);
-              _startVideoPlayback(url);
+              _startVideoPlayback(url, title: title);
             },
             child: const Text('Accept & Play'),
           ),
@@ -535,21 +760,31 @@ class _TvReceiverScreenState extends State<TvReceiverScreen> with WidgetsBinding
     );
   }
 
-  Future<void> _startVideoPlayback(String url) async {
+  Future<void> _startVideoPlayback(String url, {String title = 'Stream', Duration? startAt}) async {
     _disposePlayer();
-    setState(() => _currentStreamUrl = url);
+    setState(() {
+      _currentStreamUrl = url;
+      _currentTitle = title;
+    });
 
     _videoController = VideoPlayerController.networkUrl(Uri.parse(url));
     try {
       await _videoController!.initialize();
+      if (startAt != null && startAt > Duration.zero) {
+        await _videoController!.seekTo(startAt);
+      }
+      await _videoController!.setPlaybackSpeed(_currentSpeed);
+
       _chewieController = ChewieController(
         videoPlayerController: _videoController!,
         autoPlay: true,
         looping: false,
         allowFullScreen: true,
+        allowPlaybackSpeedChanging: true,
+        playbackSpeeds: const [0.5, 0.75, 1.0, 1.25, 1.5, 2.0],
         showControlsOnInitialize: false,
       );
-      setState(() {});
+      if (mounted) setState(() {});
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -558,6 +793,59 @@ class _TvReceiverScreenState extends State<TvReceiverScreen> with WidgetsBinding
       }
       setState(() => _currentStreamUrl = null);
     }
+  }
+
+  void _openTvSpeedAndQualitySheet() {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: const Color(0xFF16222D),
+      builder: (ctx) => Padding(
+        padding: const EdgeInsets.all(20),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text('TV Playback Speed', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+            const SizedBox(height: 10),
+            Wrap(
+              spacing: 10,
+              children: [0.5, 0.75, 1.0, 1.25, 1.5, 2.0].map((s) {
+                final selected = _currentSpeed == s;
+                return ChoiceChip(
+                  label: Text('${s}x'),
+                  selected: selected,
+                  selectedColor: Colors.tealAccent.withOpacity(0.3),
+                  onSelected: (_) {
+                    Navigator.pop(ctx);
+                    _setPlaybackSpeed(s);
+                  },
+                );
+              }).toList(),
+            ),
+            if (_availableQualities.isNotEmpty) ...[
+              const SizedBox(height: 20),
+              const Text('Video Quality / Resolution', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+              const SizedBox(height: 10),
+              Wrap(
+                spacing: 10,
+                children: _availableQualities.map((q) {
+                  final selected = _currentQualityLabel == q.label;
+                  return ChoiceChip(
+                    label: Text(q.label),
+                    selected: selected,
+                    selectedColor: Colors.cyanAccent.withOpacity(0.3),
+                    onSelected: (_) {
+                      Navigator.pop(ctx);
+                      _switchStreamQuality(q.url, q.label);
+                    },
+                  );
+                }).toList(),
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
   }
 
   void _disposePlayer() {
@@ -574,7 +862,9 @@ class _TvReceiverScreenState extends State<TvReceiverScreen> with WidgetsBinding
     for (var s in _sockets) {
       s.close();
     }
+    _udpSocket?.close();
     _server?.close();
+    _mqttClient?.disconnect();
     super.dispose();
   }
 
@@ -589,13 +879,29 @@ class _TvReceiverScreenState extends State<TvReceiverScreen> with WidgetsBinding
             Positioned(
               top: 24,
               left: 24,
-              child: ElevatedButton.icon(
-                onPressed: () {
-                  _disposePlayer();
-                  setState(() => _currentStreamUrl = null);
-                },
-                icon: const Icon(Icons.arrow_back),
-                label: const Text('Exit Stream'),
+              right: 24,
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  ElevatedButton.icon(
+                    onPressed: () {
+                      _disposePlayer();
+                      setState(() => _currentStreamUrl = null);
+                    },
+                    icon: const Icon(Icons.arrow_back),
+                    label: const Text('Exit Stream'),
+                  ),
+                  Row(
+                    children: [
+                      ElevatedButton.icon(
+                        autofocus: true,
+                        onPressed: _openTvSpeedAndQualitySheet,
+                        icon: const Icon(Icons.tune, color: Colors.tealAccent),
+                        label: Text('Speed (${_currentSpeed}x) & Quality ($_currentQualityLabel)'),
+                      ),
+                    ],
+                  ),
+                ],
               ),
             ),
           ],
@@ -605,7 +911,7 @@ class _TvReceiverScreenState extends State<TvReceiverScreen> with WidgetsBinding
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('TV Receiver Standby'),
+        title: Text(_deviceName),
         actions: [
           IconButton(
             icon: const Icon(Icons.system_update, color: Colors.tealAccent),
@@ -616,9 +922,9 @@ class _TvReceiverScreenState extends State<TvReceiverScreen> with WidgetsBinding
             child: Padding(
               padding: const EdgeInsets.only(right: 20, left: 8),
               child: Text(
-                'Connected: ${_sockets.length}',
+                _mqttConnected ? 'Router-Bypass: Ready' : 'LAN Standby',
                 style: TextStyle(
-                  color: _sockets.isNotEmpty ? Colors.tealAccent : Colors.grey,
+                  color: (_sockets.isNotEmpty || _mqttConnected) ? Colors.tealAccent : Colors.grey,
                   fontWeight: FontWeight.bold,
                 ),
               ),
@@ -629,44 +935,61 @@ class _TvReceiverScreenState extends State<TvReceiverScreen> with WidgetsBinding
       body: Center(
         child: SingleChildScrollView(
           scrollDirection: Axis.horizontal,
-          child: Row(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              Container(
-                padding: const EdgeInsets.all(16),
-                decoration: BoxDecoration(
-                  color: Colors.white,
-                  borderRadius: BorderRadius.circular(16),
+          child: Padding(
+            padding: const EdgeInsets.all(24),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Container(
+                  padding: const EdgeInsets.all(16),
+                  decoration: BoxDecoration(
+                    color: Colors.white,
+                    borderRadius: BorderRadius.circular(16),
+                  ),
+                  child: QrImageView(
+                    data: _pairingQrData,
+                    version: QrVersions.auto,
+                    size: 220.0,
+                  ),
                 ),
-                child: QrImageView(
-                  data: _pairingAddress,
-                  version: QrVersions.auto,
-                  size: 220.0,
+                const SizedBox(width: 40),
+                Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      'Scan QR or Auto-Discover on Wi-Fi',
+                      style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
+                    ),
+                    const SizedBox(height: 12),
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+                      decoration: BoxDecoration(
+                        color: Colors.tealAccent.withOpacity(0.15),
+                        borderRadius: BorderRadius.circular(8),
+                        border: Border.all(color: Colors.tealAccent),
+                      ),
+                      child: Text(
+                        'TV Pairing Code (Works on any Router): $_roomCode',
+                        style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Colors.tealAccent),
+                      ),
+                    ),
+                    const SizedBox(height: 10),
+                    Text(
+                      'Local Wi-Fi Address: ws://$_localIp:$kReceiverPort',
+                      style: const TextStyle(fontSize: 15, color: Colors.white70),
+                    ),
+                    const SizedBox(height: 16),
+                    const Text(
+                      '• Appears automatically in your Phone Controller device list.\n'
+                      '• Works even if your Wi-Fi Router has AP/Client Isolation enabled.\n'
+                      '• Supports YouTube, Instagram Reels/Posts, HLS (.m3u8) & MP4.',
+                      style: TextStyle(color: Colors.grey, height: 1.5),
+                    ),
+                  ],
                 ),
-              ),
-              const SizedBox(width: 40),
-              Column(
-                mainAxisAlignment: MainAxisAlignment.center,
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const Text(
-                    'Scan with Controller App',
-                    style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
-                  ),
-                  const SizedBox(height: 8),
-                  Text(
-                    'Manual Server URL: $_pairingAddress',
-                    style: const TextStyle(fontSize: 16, color: Colors.tealAccent),
-                  ),
-                  const SizedBox(height: 16),
-                  const Text(
-                    '• While this screen is open, streams play immediately.\n'
-                    '• When minimized, incoming streams trigger an Accept/Reject popup.',
-                    style: TextStyle(color: Colors.grey, height: 1.5),
-                  ),
-                ],
-              ),
-            ],
+              ],
+            ),
           ),
         ),
       ),
@@ -674,6 +997,9 @@ class _TvReceiverScreenState extends State<TvReceiverScreen> with WidgetsBinding
   }
 }
 
+// ============================================================================
+// BACKGROUND OVERLAY POPUP
+// ============================================================================
 class BackgroundOverlayPrompt extends StatefulWidget {
   const BackgroundOverlayPrompt({super.key});
 
@@ -683,13 +1009,17 @@ class BackgroundOverlayPrompt extends StatefulWidget {
 
 class _BackgroundOverlayPromptState extends State<BackgroundOverlayPrompt> {
   String _incomingUrl = '';
+  String _incomingTitle = 'Incoming TV Stream';
 
   @override
   void initState() {
     super.initState();
     FlutterOverlayWindow.overlayListener.listen((data) {
       if (data is Map && data['url'] != null) {
-        setState(() => _incomingUrl = data['url']);
+        setState(() {
+          _incomingUrl = data['url'];
+          _incomingTitle = data['title'] ?? 'Incoming TV Stream';
+        });
       }
     });
   }
@@ -709,13 +1039,17 @@ class _BackgroundOverlayPromptState extends State<BackgroundOverlayPrompt> {
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const Row(
+            Row(
               children: [
-                Icon(Icons.live_tv, color: Colors.tealAccent),
-                SizedBox(width: 10),
-                Text(
-                  'Incoming TV Stream',
-                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Colors.white),
+                const Icon(Icons.live_tv, color: Colors.tealAccent),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Text(
+                    _incomingTitle,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Colors.white),
+                  ),
                 ),
               ],
             ),
@@ -738,7 +1072,11 @@ class _BackgroundOverlayPromptState extends State<BackgroundOverlayPrompt> {
                 ElevatedButton(
                   autofocus: true,
                   onPressed: () async {
-                    await FlutterOverlayWindow.shareData({'action': 'ACCEPT', 'url': _incomingUrl});
+                    await FlutterOverlayWindow.shareData({
+                      'action': 'ACCEPT',
+                      'url': _incomingUrl,
+                      'title': _incomingTitle,
+                    });
                     await FlutterOverlayWindow.closeOverlay();
                   },
                   child: const Text('Accept & Play'),
@@ -752,6 +1090,9 @@ class _BackgroundOverlayPromptState extends State<BackgroundOverlayPrompt> {
   }
 }
 
+// ============================================================================
+// PHONE CONTROLLER MODE (Wi-Fi Device Scanner + History + YT/IG + Speed/Quality)
+// ============================================================================
 class ControllerScreen extends StatefulWidget {
   const ControllerScreen({super.key});
 
@@ -761,12 +1102,279 @@ class ControllerScreen extends StatefulWidget {
 
 class _ControllerScreenState extends State<ControllerScreen> {
   WebSocket? _socket;
+  MqttServerClient? _mqttClient;
+  String? _pairedRoomCode;
+  String _connectedDeviceName = '';
   bool _isConnected = false;
-  bool _isExtracting = false;
+  bool _usingRouterBypass = false;
 
-  final TextEditingController _wsAddressCtrl = TextEditingController(text: 'ws://192.168.1.');
+  bool _isScanningWifi = false;
+  final Map<String, DiscoveredReceiver> _discoveredDevices = {};
+
+  bool _isExtracting = false;
+  final TextEditingController _wsAddressCtrl = TextEditingController();
   final TextEditingController _urlInputCtrl = TextEditingController();
-  List<String> _extractedStreams = [];
+
+  String _extractedTitle = '';
+  List<StreamQualityOption> _extractedQualities = [];
+  StreamQualityOption? _selectedQuality;
+  double _selectedSpeed = 1.0;
+
+  List<PlaybackHistoryItem> _history = [];
+
+  @override
+  void initState() {
+    super.initState();
+    _loadHistory();
+    _initMqttControllerBus();
+    _scanWifiForReceivers();
+  }
+
+  @override
+  void dispose() {
+    _socket?.close();
+    _mqttClient?.disconnect();
+    _wsAddressCtrl.dispose();
+    _urlInputCtrl.dispose();
+    super.dispose();
+  }
+
+  Future<void> _initMqttControllerBus() async {
+    final clientId = 'ds_ctrl_${Random().nextInt(99999)}';
+    final client = MqttServerClient(kMqttBroker, clientId);
+    client.port = 1883;
+    client.keepAlivePeriod = 30;
+    client.autoReconnect = true;
+    client.logging(on: false);
+
+    client.onConnected = () {
+      client.subscribe('directstream/lan/announce', MqttQos.atMostOnce);
+      _broadcastMqttDiscoveryPing();
+    };
+
+    try {
+      await client.connect();
+      _mqttClient = client;
+      client.updates?.listen((List<MqttReceivedMessage<MqttMessage?>>? c) {
+        if (c == null || c.isEmpty) return;
+        final recMess = c[0].payload as MqttPublishMessage;
+        final payloadStr = MqttPublishPayload.bytesToStringAsString(recMess.payload.message);
+        try {
+          final data = jsonDecode(payloadStr);
+          if (data['app'] == 'DirectStream' && data['room'] != null) {
+            final dev = DiscoveredReceiver(
+              name: data['name'] ?? 'DirectStream TV',
+              ip: data['ip'] ?? '',
+              port: data['port'] ?? kReceiverPort,
+              roomCode: data['room'],
+              mode: 'Router-Bypass',
+            );
+            if (mounted) {
+              setState(() {
+                _discoveredDevices[dev.roomCode] = dev;
+              });
+            }
+          }
+        } catch (_) {}
+      });
+    } catch (_) {}
+  }
+
+  void _broadcastMqttDiscoveryPing() {
+    if (_mqttClient?.connectionStatus?.state == MqttConnectionState.connected) {
+      final builder = MqttClientPayloadBuilder();
+      builder.addString('DISCOVER');
+      _mqttClient!.publishMessage('directstream/lan/discover', MqttQos.atMostOnce, builder.payload!);
+    }
+  }
+
+  /// Scans local Wi-Fi via UDP Broadcast + Parallel Subnet Sweep (1..254) + Router-Bypass Relay
+  Future<void> _scanWifiForReceivers() async {
+    if (_isScanningWifi) return;
+    setState(() => _isScanningWifi = true);
+
+    _broadcastMqttDiscoveryPing();
+
+    // 1. UDP Broadcast discovery
+    try {
+      final udp = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
+      udp.broadcastEnabled = true;
+      udp.listen((event) {
+        if (event == RawSocketEvent.read) {
+          final dg = udp.receive();
+          if (dg == null) return;
+          try {
+            final data = jsonDecode(utf8.decode(dg.data));
+            if (data['app'] == 'DirectStream') {
+              final dev = DiscoveredReceiver(
+                name: data['name'] ?? 'DirectStream TV',
+                ip: data['ip'] ?? dg.address.address,
+                port: data['port'] ?? kReceiverPort,
+                roomCode: data['room'] ?? '',
+                mode: 'LAN',
+              );
+              if (mounted) {
+                setState(() {
+                  _discoveredDevices[dev.roomCode.isNotEmpty ? dev.roomCode : dev.ip] = dev;
+                });
+              }
+            }
+          } catch (_) {}
+        }
+      });
+      udp.send(utf8.encode('DIRECTSTREAM_DISCOVER'), InternetAddress('255.255.255.255'), kDiscoveryUdpPort);
+      Future.delayed(const Duration(seconds: 3), () => udp.close());
+    } catch (_) {}
+
+    // 2. Parallel HTTP Subnet Sweep across local /24 Wi-Fi network
+    try {
+      String? myIp = await NetworkInfo().getWifiIP();
+      if (myIp == null) {
+        final interfaces = await NetworkInterface.list(type: InternetAddressType.IPv4);
+        for (var iface in interfaces) {
+          for (var addr in iface.addresses) {
+            if (!addr.isLoopback && addr.address.startsWith('192.168.')) {
+              myIp = addr.address;
+              break;
+            }
+          }
+        }
+      }
+
+      if (myIp != null && myIp.contains('.')) {
+        final subnet = myIp.substring(0, myIp.lastIndexOf('.'));
+        final client = http.Client();
+        final List<Future<void>> probes = [];
+
+        for (int i = 1; i <= 254; i++) {
+          final targetIp = '$subnet.$i';
+          probes.add(() async {
+            try {
+              final res = await client
+                  .get(Uri.parse('http://$targetIp:$kReceiverPort/discover'))
+                  .timeout(const Duration(milliseconds: 650));
+              if (res.statusCode == 200) {
+                final data = jsonDecode(res.body);
+                if (data['app'] == 'DirectStream') {
+                  final dev = DiscoveredReceiver(
+                    name: data['name'] ?? 'DirectStream TV ($targetIp)',
+                    ip: targetIp,
+                    port: data['port'] ?? kReceiverPort,
+                    roomCode: data['room'] ?? targetIp,
+                    mode: 'LAN',
+                  );
+                  if (mounted) {
+                    setState(() {
+                      _discoveredDevices[dev.roomCode] = dev;
+                    });
+                  }
+                }
+              }
+            } catch (_) {}
+          }());
+        }
+        await Future.wait(probes);
+        client.close();
+      }
+    } catch (_) {}
+
+    if (mounted) setState(() => _isScanningWifi = false);
+  }
+
+  /// Connects to a Discovered TV or manual input. Automatically falls back to Router-Bypass Relay
+  /// if the home Wi-Fi router blocks direct local sockets (AP Isolation).
+  Future<void> _connectToReceiver({String? rawInput, DiscoveredReceiver? device}) async {
+    String? wsCandidate;
+    String? roomCandidate = device?.roomCode;
+    String label = device?.name ?? '';
+
+    if (rawInput != null && rawInput.trim().isNotEmpty) {
+      final trimmed = rawInput.trim();
+      // Check if JSON from QR code
+      if (trimmed.startsWith('{')) {
+        try {
+          final parsed = jsonDecode(trimmed);
+          wsCandidate = parsed['ws'];
+          roomCandidate = parsed['room']?.toString();
+          label = parsed['name'] ?? 'DirectStream TV';
+        } catch (_) {}
+      } else if (RegExp(r'^\d{6}$').hasMatch(trimmed)) {
+        // 6-digit TV Room Code entered directly
+        roomCandidate = trimmed;
+        label = 'TV Room $trimmed';
+      } else {
+        wsCandidate = _normalizeWsAddress(trimmed);
+        label = wsCandidate;
+      }
+    } else if (device != null) {
+      wsCandidate = device.wsUrl;
+    }
+
+    // 1. Try Direct Low-Latency LAN WebSocket first (2.5 second timeout)
+    if (wsCandidate != null && wsCandidate.isNotEmpty) {
+      try {
+        final ws = await WebSocket.connect(wsCandidate).timeout(const Duration(milliseconds: 2500));
+        if (!mounted) return;
+        setState(() {
+          _socket = ws;
+          _isConnected = true;
+          _usingRouterBypass = false;
+          _pairedRoomCode = roomCandidate;
+          _connectedDeviceName = label.isNotEmpty ? label : wsCandidate!;
+          _wsAddressCtrl.text = wsCandidate!;
+        });
+        ws.listen(
+          null,
+          onDone: () {
+            if (mounted && !_usingRouterBypass) setState(() => _isConnected = false);
+          },
+          onError: (_) {
+            if (mounted && !_usingRouterBypass) setState(() => _isConnected = false);
+          },
+        );
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Connected via LAN to $_connectedDeviceName!'), backgroundColor: Colors.teal),
+        );
+        return;
+      } catch (_) {
+        // Direct LAN failed (e.g. Router AP Isolation) -> Fall through to Router-Bypass Relay if room code is known
+      }
+    }
+
+    // 2. Router AP-Isolation Bypass via MQTT Relay
+    if (roomCandidate != null && roomCandidate.isNotEmpty) {
+      if (_mqttClient?.connectionStatus?.state != MqttConnectionState.connected) {
+        await _initMqttControllerBus();
+      }
+      if (_mqttClient?.connectionStatus?.state == MqttConnectionState.connected) {
+        setState(() {
+          _isConnected = true;
+          _usingRouterBypass = true;
+          _pairedRoomCode = roomCandidate;
+          _connectedDeviceName = '$label (Router-Bypass)';
+          _wsAddressCtrl.text = 'Room: $roomCandidate';
+        });
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text('Connected to $_connectedDeviceName (Router Isolation Bypassed)!'),
+              backgroundColor: Colors.teal,
+            ),
+          );
+        }
+        return;
+      }
+    }
+
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Could not reach TV over LAN. Enter the 6-digit TV Pairing Code or scan the QR code to bypass Router Isolation!'),
+          backgroundColor: Colors.redAccent,
+        ),
+      );
+    }
+  }
 
   String _normalizeWsAddress(String rawInput) {
     String cleaned = rawInput.trim();
@@ -780,135 +1388,411 @@ class _ControllerScreenState extends State<ControllerScreen> {
     }
     final noPortRegex = RegExp(r'^(wss?://\d+\.\d+\.\d+\.\d+)$');
     if (noPortRegex.hasMatch(cleaned)) {
-      cleaned = '$cleaned:8080';
+      cleaned = '$cleaned:$kReceiverPort';
     }
     return cleaned;
-  }
-
-  Future<void> _connectToTv(String rawWsUrl) async {
-    final wsUrl = _normalizeWsAddress(rawWsUrl);
-    setState(() {
-      _wsAddressCtrl.text = wsUrl;
-    });
-
-    try {
-      final ws = await WebSocket.connect(wsUrl).timeout(const Duration(seconds: 5));
-      if (!mounted) return;
-      setState(() {
-        _socket = ws;
-        _isConnected = true;
-      });
-      ws.listen(
-        null,
-        onDone: () {
-          if (mounted) setState(() => _isConnected = false);
-        },
-        onError: (_) {
-          if (mounted) setState(() => _isConnected = false);
-        },
-      );
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Paired with TV Receiver ($wsUrl)!'), backgroundColor: Colors.teal),
-      );
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Connection failed: $e'), backgroundColor: Colors.redAccent),
-        );
-      }
-    }
   }
 
   Future<void> _openQrScanner() async {
     final String? scannedCode = await Navigator.push<String>(
       context,
-      MaterialPageRoute(
-        builder: (_) => const QrScannerPage(),
-      ),
+      MaterialPageRoute(builder: (_) => const QrScannerPage()),
     );
-
     if (scannedCode != null && scannedCode.isNotEmpty && mounted) {
-      await _connectToTv(scannedCode);
+      await _connectToReceiver(rawInput: scannedCode);
     }
   }
 
+  // ==========================================================================
+  // STREAM EXTRACTOR (YouTube + Instagram Reels/Posts + IPTV .m3u8 + Web MP4)
+  // ==========================================================================
   Future<void> _extractVideoStreams(String rawUrl) async {
     final cleanUrl = rawUrl.trim();
     if (cleanUrl.isEmpty) return;
 
     setState(() {
       _isExtracting = true;
-      _extractedStreams = [];
+      _extractedQualities = [];
+      _selectedQuality = null;
+      _extractedTitle = 'Extracted Video';
     });
 
-    final Set<String> results = {};
+    final List<StreamQualityOption> qualities = [];
 
-    final directStreamRegex = RegExp(r'\.(m3u8|mp4|webm|mkv|mpd)(\?.*)?$', caseSensitive: false);
-    if (directStreamRegex.hasMatch(cleanUrl)) {
-      results.add(cleanUrl);
-    } else {
-      try {
+    try {
+      // 1. Check if YouTube Video / Shorts URL
+      if (cleanUrl.contains('youtube.com/') || cleanUrl.contains('youtu.be/')) {
+        final ytExplode = yt.YoutubeExplode();
+        try {
+          final video = await ytExplode.videos.get(cleanUrl);
+          _extractedTitle = video.title;
+          final manifest = await ytExplode.videos.streamsClient.getManifest(video.id);
+
+          final muxed = manifest.muxed.sortByVideoQuality();
+          final Set<String> seenLabels = {};
+          for (final s in muxed) {
+            final label = s.qualityLabel;
+            if (!seenLabels.contains(label)) {
+              seenLabels.add(label);
+              qualities.add(StreamQualityOption(label: label, url: s.url.toString()));
+            }
+          }
+          // Also include HLS manifest if available
+          if (manifest.hls.isNotEmpty) {
+            qualities.add(StreamQualityOption(
+              label: 'Auto (HLS)',
+              url: manifest.hls.first.url.toString(),
+            ));
+          }
+        } finally {
+          ytExplode.close();
+        }
+      }
+      // 2. Check if Instagram Reel / Post URL
+      else if (cleanUrl.contains('instagram.com/')) {
+        _extractedTitle = 'Instagram Video';
+        final igStreams = await _extractInstagramVideo(cleanUrl);
+        qualities.addAll(igStreams);
+      }
+      // 3. Direct IPTV (.m3u8) or Direct Video Link (.mp4, .webm, .mkv)
+      else if (RegExp(r'\.(m3u8|mp4|webm|mkv|mpd)(\?.*)?$', caseSensitive: false).hasMatch(cleanUrl)) {
+        final isHls = cleanUrl.toLowerCase().contains('.m3u8');
+        _extractedTitle = isHls ? 'IPTV / HLS Stream' : 'Direct Video Stream';
+        qualities.add(StreamQualityOption(label: isHls ? 'Auto (HLS)' : 'Original HD', url: cleanUrl));
+
+        // If master .m3u8 playlist, parse resolution variants (1080p, 720p, 480p)
+        if (isHls) {
+          final variants = await _parseHlsMasterVariants(cleanUrl);
+          qualities.addAll(variants);
+        }
+      }
+      // 4. Generic Webpage Scraper (Extracts embedded .m3u8 / .mp4 + og:video)
+      else {
         final response = await http.get(
           Uri.parse(cleanUrl),
           headers: {
             'User-Agent':
-                'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36',
+                'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36',
           },
         );
-
         if (response.statusCode == 200) {
+          final titleMatch = RegExp(r'<title>(.*?)</title>', caseSensitive: false).firstMatch(response.body);
+          if (titleMatch != null && titleMatch.group(1) != null) {
+            _extractedTitle = titleMatch.group(1)!.trim();
+          }
           final body = response.body.replaceAll(r'\/', '/');
           final urlRegex = RegExp(
             r'''(https?://[^\s"'<>\\]+\.(?:m3u8|mp4|webm)(?:\?[^\s"'<>\\]*)?)''',
             caseSensitive: false,
           );
+          final Set<String> foundUrls = {};
           for (final match in urlRegex.allMatches(body)) {
-            if (match.group(0) != null) {
-              results.add(match.group(0)!);
+            final u = match.group(0);
+            if (u != null && !foundUrls.contains(u)) {
+              foundUrls.add(u);
+              final label = u.contains('.m3u8')
+                  ? 'HLS Stream #${foundUrls.length}'
+                  : 'Direct MP4 #${foundUrls.length}';
+              qualities.add(StreamQualityOption(label: label, url: u));
             }
           }
         }
-      } catch (e) {
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text('Scrape error: $e')),
-          );
-        }
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Extraction notice: $e')),
+        );
       }
     }
 
     setState(() {
-      _extractedStreams = results.toList();
+      _extractedQualities = qualities;
+      if (qualities.isNotEmpty) {
+        _selectedQuality = qualities.first;
+      }
       _isExtracting = false;
     });
   }
 
-  void _sendCommand(String command, {String? streamUrl}) {
-    if (!_isConnected || _socket == null) {
+  Future<List<StreamQualityOption>> _extractInstagramVideo(String igUrl) async {
+    final List<StreamQualityOption> list = [];
+    final Set<String> urls = {};
+    try {
+      final cleanIgUrl = igUrl.split('?').first;
+      final embedUrl = cleanIgUrl.endsWith('/') ? '${cleanIgUrl}embed/captioned/' : '$cleanIgUrl/embed/captioned/';
+
+      for (final target in [igUrl, embedUrl]) {
+        final res = await http.get(
+          Uri.parse(target),
+          headers: {
+            'User-Agent':
+                'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
+          },
+        );
+        if (res.statusCode == 200) {
+          final decoded = res.body
+              .replaceAll(r'\/', '/')
+              .replaceAll(r'\u0026', '&')
+              .replaceAll('&amp;', '&');
+
+          // Check og:video meta tag and video_url JSON keys
+          final ogRegex = RegExp(r'property="og:video"\s+content="([^"]+)"');
+          final jsonVideoRegex = RegExp(r'"video_url"\s*:\s*"([^"]+)"');
+          final mp4Regex = RegExp(r'(https?://[^\s"<>\\]+\.mp4\?[^\s"<>\\]+)');
+
+          for (final m in [
+            ...ogRegex.allMatches(decoded),
+            ...jsonVideoRegex.allMatches(decoded),
+            ...mp4Regex.allMatches(decoded),
+          ]) {
+            final u = m.group(1);
+            if (u != null && u.startsWith('http') && !urls.contains(u)) {
+              urls.add(u);
+              list.add(StreamQualityOption(
+                label: list.isEmpty ? 'Instagram HD' : 'Instagram Stream #${list.length + 1}',
+                url: u,
+              ));
+            }
+          }
+        }
+        if (list.isNotEmpty) break;
+      }
+    } catch (_) {}
+    return list;
+  }
+
+  Future<List<StreamQualityOption>> _parseHlsMasterVariants(String masterUrl) async {
+    final List<StreamQualityOption> variants = [];
+    try {
+      final res = await http.get(Uri.parse(masterUrl)).timeout(const Duration(seconds: 4));
+      if (res.statusCode == 200 && res.body.contains('#EXT-X-STREAM-INF')) {
+        final lines = res.body.split('\n');
+        final baseUri = Uri.parse(masterUrl);
+        for (int i = 0; i < lines.length; i++) {
+          final line = lines[i].trim();
+          if (line.startsWith('#EXT-X-STREAM-INF')) {
+            String label = 'Variant';
+            final resMatch = RegExp(r'RESOLUTION=\d+x(\d+)').firstMatch(line);
+            if (resMatch != null) {
+              label = '${resMatch.group(1)}p';
+            }
+            if (i + 1 < lines.length) {
+              final nextLine = lines[i + 1].trim();
+              if (nextLine.isNotEmpty && !nextLine.startsWith('#')) {
+                final resolvedUrl = baseUri.resolve(nextLine).toString();
+                variants.add(StreamQualityOption(label: label, url: resolvedUrl));
+              }
+            }
+          }
+        }
+      }
+    } catch (_) {}
+    return variants;
+  }
+
+  // ==========================================================================
+  // PLAYBACK HISTORY STORAGE (SharedPreferences)
+  // ==========================================================================
+  Future<void> _loadHistory() async {
+    final prefs = await SharedPreferences.getInstance();
+    final List<String> rawList = prefs.getStringList('playback_history_v4') ?? [];
+    setState(() {
+      _history = rawList
+          .map((item) => PlaybackHistoryItem.fromJson(jsonDecode(item)))
+          .toList();
+    });
+  }
+
+  Future<void> _saveToHistory({
+    required String title,
+    required String originalUrl,
+    required String streamUrl,
+    required List<StreamQualityOption> qualities,
+  }) async {
+    final now = DateTime.now();
+    final timeStr =
+        '${now.day.toString().padLeft(2, '0')}/${now.month.toString().padLeft(2, '0')} ${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}';
+
+    final newItem = PlaybackHistoryItem(
+      title: title,
+      originalUrl: originalUrl,
+      streamUrl: streamUrl,
+      qualities: qualities,
+      timestamp: timeStr,
+    );
+
+    _history.removeWhere((h) => h.streamUrl == streamUrl || (originalUrl.isNotEmpty && h.originalUrl == originalUrl));
+    _history.insert(0, newItem);
+    if (_history.length > 40) {
+      _history = _history.sublist(0, 40);
+    }
+
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setStringList(
+      'playback_history_v4',
+      _history.map((h) => jsonEncode(h.toJson())).toList(),
+    );
+    if (mounted) setState(() {});
+  }
+
+  void _openHistoryModal() {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: const Color(0xFF16222D),
+      isScrollControlled: true,
+      builder: (ctx) => DraggableScrollableSheet(
+        expand: false,
+        initialChildSize: 0.65,
+        maxChildSize: 0.9,
+        builder: (_, scrollCtrl) => Padding(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  const Row(
+                    children: [
+                      Icon(Icons.history, color: Colors.tealAccent),
+                      SizedBox(width: 8),
+                      Text('Playback History', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                    ],
+                  ),
+                  if (_history.isNotEmpty)
+                    TextButton.icon(
+                      onPressed: () async {
+                        final prefs = await SharedPreferences.getInstance();
+                        await prefs.remove('playback_history_v4');
+                        setState(() => _history.clear());
+                        if (ctx.mounted) Navigator.pop(ctx);
+                      },
+                      icon: const Icon(Icons.delete_outline, color: Colors.redAccent, size: 18),
+                      label: const Text('Clear All', style: TextStyle(color: Colors.redAccent)),
+                    ),
+                ],
+              ),
+              const Divider(color: Colors.white24),
+              Expanded(
+                child: _history.isEmpty
+                    ? const Center(
+                        child: Text('No videos played yet. Cast a stream to save it here!',
+                            style: TextStyle(color: Colors.grey)),
+                      )
+                    : ListView.builder(
+                        controller: scrollCtrl,
+                        itemCount: _history.length,
+                        itemBuilder: (_, idx) {
+                          final item = _history[idx];
+                          return Card(
+                            margin: const EdgeInsets.only(bottom: 8),
+                            child: ListTile(
+                              leading: const Icon(Icons.play_circle_fill, color: Colors.tealAccent, size: 34),
+                              title: Text(item.title, maxLines: 1, overflow: TextOverflow.ellipsis),
+                              subtitle: Text('${item.timestamp} • ${item.originalUrl}',
+                                  maxLines: 1, overflow: TextOverflow.ellipsis),
+                              trailing: ElevatedButton(
+                                onPressed: () {
+                                  Navigator.pop(ctx);
+                                  setState(() {
+                                    _extractedTitle = item.title;
+                                    _extractedQualities = item.qualities.isNotEmpty
+                                        ? item.qualities
+                                        : [StreamQualityOption(label: 'Auto', url: item.streamUrl)];
+                                    _selectedQuality = _extractedQualities.first;
+                                  });
+                                  _castStreamToTv(
+                                    streamUrl: item.streamUrl,
+                                    title: item.title,
+                                    originalUrl: item.originalUrl,
+                                    qualities: _extractedQualities,
+                                    qualityLabel: _extractedQualities.first.label,
+                                  );
+                                },
+                                child: const Text('Play on TV'),
+                              ),
+                            ),
+                          );
+                        },
+                      ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  // ==========================================================================
+  // SEND COMMANDS TO TV (LAN WebSocket OR Router-Bypass MQTT Relay)
+  // ==========================================================================
+  void _sendPayload(Map<String, dynamic> data) {
+    if (!_isConnected) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Pair with TV first!')),
+        const SnackBar(content: Text('Select or connect to a DirectStream TV first!')),
       );
       return;
     }
-    _socket!.add(jsonEncode({
-      'command': command,
-      if (streamUrl != null) 'url': streamUrl,
-    }));
+
+    final encoded = jsonEncode(data);
+    if (!_usingRouterBypass && _socket != null) {
+      _socket!.add(encoded);
+    } else if (_pairedRoomCode != null &&
+        _mqttClient?.connectionStatus?.state == MqttConnectionState.connected) {
+      final builder = MqttClientPayloadBuilder();
+      builder.addString(encoded);
+      _mqttClient!.publishMessage(
+        'directstream/room/$_pairedRoomCode/cmd',
+        MqttQos.atLeastOnce,
+        builder.payload!,
+      );
+    }
+  }
+
+  void _castStreamToTv({
+    required String streamUrl,
+    required String title,
+    required String originalUrl,
+    required List<StreamQualityOption> qualities,
+    required String qualityLabel,
+  }) {
+    _sendPayload({
+      'command': 'PLAY',
+      'url': streamUrl,
+      'title': title,
+      'qualityLabel': qualityLabel,
+      'qualities': qualities.map((q) => q.toJson()).toList(),
+    });
+
+    _saveToHistory(
+      title: title,
+      originalUrl: originalUrl,
+      streamUrl: streamUrl,
+      qualities: qualities,
+    );
   }
 
   @override
   Widget build(BuildContext context) {
+    final devicesList = _discoveredDevices.values.toList();
+
     return Scaffold(
       appBar: AppBar(
         title: const Text('Phone Controller'),
         actions: [
+          IconButton(
+            icon: const Icon(Icons.history, color: Colors.cyanAccent),
+            tooltip: 'Playback History',
+            onPressed: _openHistoryModal,
+          ),
           IconButton(
             icon: const Icon(Icons.system_update, color: Colors.tealAccent),
             tooltip: 'Check GitHub Update',
             onPressed: () => GitHubAutoUpdater.checkForUpdate(context, silentIfUpToDate: false),
           ),
           Padding(
-            padding: const EdgeInsets.only(right: 16, left: 4),
+            padding: const EdgeInsets.only(right: 14, left: 4),
             child: Icon(
               _isConnected ? Icons.cast_connected : Icons.cast,
               color: _isConnected ? Colors.tealAccent : Colors.grey,
@@ -919,24 +1803,76 @@ class _ControllerScreenState extends State<ControllerScreen> {
       body: ListView(
         padding: const EdgeInsets.all(16),
         children: [
+          // 1. AUTO-DISCOVERED WIFI RECEIVERS + PAIRING CARD
           Card(
             child: Padding(
               padding: const EdgeInsets.all(16),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text(
-                    _isConnected ? 'Status: Paired with TV' : 'Step 1: Pair with TV Receiver',
-                    style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      Expanded(
+                        child: Text(
+                          _isConnected
+                              ? 'Connected: $_connectedDeviceName'
+                              : 'Step 1: Select DirectStream TV on Wi-Fi',
+                          style: TextStyle(
+                            fontWeight: FontWeight.bold,
+                            fontSize: 16,
+                            color: _isConnected ? Colors.tealAccent : Colors.white,
+                          ),
+                        ),
+                      ),
+                      TextButton.icon(
+                        onPressed: _isScanningWifi ? null : _scanWifiForReceivers,
+                        icon: _isScanningWifi
+                            ? const SizedBox(
+                                width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2))
+                            : const Icon(Icons.wifi_find, size: 18),
+                        label: Text(_isScanningWifi ? 'Scanning...' : 'Scan Wi-Fi'),
+                      ),
+                    ],
                   ),
-                  const SizedBox(height: 12),
+                  if (devicesList.isNotEmpty) ...[
+                    const SizedBox(height: 8),
+                    ...devicesList.map((dev) => Container(
+                          margin: const EdgeInsets.only(bottom: 6),
+                          decoration: BoxDecoration(
+                            color: Colors.tealAccent.withOpacity(0.08),
+                            borderRadius: BorderRadius.circular(8),
+                            border: Border.all(color: Colors.tealAccent.withOpacity(0.3)),
+                          ),
+                          child: ListTile(
+                            dense: true,
+                            leading: const Icon(Icons.tv, color: Colors.tealAccent),
+                            title: Text(dev.name, style: const TextStyle(fontWeight: FontWeight.bold)),
+                            subtitle: Text('IP: ${dev.ip} • Room Code: ${dev.roomCode} (${dev.mode})'),
+                            trailing: ElevatedButton(
+                              onPressed: () => _connectToReceiver(device: dev),
+                              child: const Text('Pair'),
+                            ),
+                          ),
+                        )),
+                  ] else if (!_isScanningWifi) ...[
+                    const Padding(
+                      padding: EdgeInsets.only(bottom: 10),
+                      child: Text(
+                        'No TV found on subnet yet. Tap "Scan Wi-Fi", scan the TV QR code, or enter the 6-digit TV Room Code below:',
+                        style: TextStyle(color: Colors.grey, fontSize: 12),
+                      ),
+                    ),
+                  ],
+                  const SizedBox(height: 8),
                   Row(
                     children: [
                       Expanded(
                         child: TextField(
                           controller: _wsAddressCtrl,
                           decoration: const InputDecoration(
-                            labelText: 'TV WebSocket IP (e.g. ws://192.168.1.39:8080)',
+                            labelText: '6-Digit Room Code or TV IP',
+                            hintText: 'e.g. 482910 or ws://192.168.1.39:8080',
                             border: OutlineInputBorder(),
                             isDense: true,
                           ),
@@ -944,7 +1880,7 @@ class _ControllerScreenState extends State<ControllerScreen> {
                       ),
                       const SizedBox(width: 8),
                       ElevatedButton(
-                        onPressed: () => _connectToTv(_wsAddressCtrl.text),
+                        onPressed: () => _connectToReceiver(rawInput: _wsAddressCtrl.text),
                         child: const Text('Connect'),
                       ),
                       const SizedBox(width: 8),
@@ -960,21 +1896,36 @@ class _ControllerScreenState extends State<ControllerScreen> {
             ),
           ),
           const SizedBox(height: 16),
+
+          // 2. YOUTUBE / INSTAGRAM / IPTV / WEB EXTRACTOR CARD
           Card(
             child: Padding(
               padding: const EdgeInsets.all(16),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  const Text(
-                    'Step 2: Paste Video Page or IPTV (.m3u8) URL',
-                    style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      const Expanded(
+                        child: Text(
+                          'Step 2: YouTube, Instagram, IPTV or Web URL',
+                          style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
+                        ),
+                      ),
+                      TextButton.icon(
+                        onPressed: _openHistoryModal,
+                        icon: const Icon(Icons.history, size: 18, color: Colors.cyanAccent),
+                        label: Text('History (${_history.length})',
+                            style: const TextStyle(color: Colors.cyanAccent)),
+                      ),
+                    ],
                   ),
-                  const SizedBox(height: 12),
+                  const SizedBox(height: 8),
                   TextField(
                     controller: _urlInputCtrl,
                     decoration: InputDecoration(
-                      hintText: 'https://example.com/watch or .m3u8 link',
+                      hintText: 'Paste YouTube, Instagram Reel, .m3u8 or Web link',
                       border: const OutlineInputBorder(),
                       suffixIcon: IconButton(
                         icon: const Icon(Icons.clear),
@@ -988,9 +1939,10 @@ class _ControllerScreenState extends State<ControllerScreen> {
                     child: ElevatedButton.icon(
                       onPressed: _isExtracting ? null : () => _extractVideoStreams(_urlInputCtrl.text),
                       icon: _isExtracting
-                          ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
-                          : const Icon(Icons.radar),
-                      label: Text(_isExtracting ? 'Scraping Streams...' : 'Extract Direct Video Stream'),
+                          ? const SizedBox(
+                              width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
+                          : const Icon(Icons.bolt),
+                      label: Text(_isExtracting ? 'Extracting Qualities...' : 'Extract Ad-Free Video Stream'),
                     ),
                   ),
                 ],
@@ -998,62 +1950,133 @@ class _ControllerScreenState extends State<ControllerScreen> {
             ),
           ),
           const SizedBox(height: 16),
-          if (_isConnected)
+
+          // 3. REMOTE PLAYBACK, SPEED & QUALITY CONTROLS
+          if (_isConnected || _extractedQualities.isNotEmpty)
             Card(
               child: Padding(
-                padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 16),
-                child: Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                padding: const EdgeInsets.all(16),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    ElevatedButton.icon(
-                      onPressed: () => _sendCommand('RESUME'),
-                      icon: const Icon(Icons.play_arrow),
-                      label: const Text('Play'),
+                    const Text(
+                      'Step 3: Playback, Speed & Quality Controls',
+                      style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
                     ),
-                    ElevatedButton.icon(
-                      onPressed: () => _sendCommand('PAUSE'),
-                      icon: const Icon(Icons.pause),
-                      label: const Text('Pause'),
+                    const SizedBox(height: 12),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                      children: [
+                        ElevatedButton.icon(
+                          onPressed: () => _sendPayload({'command': 'RESUME'}),
+                          icon: const Icon(Icons.play_arrow),
+                          label: const Text('Play'),
+                        ),
+                        ElevatedButton.icon(
+                          onPressed: () => _sendPayload({'command': 'PAUSE'}),
+                          icon: const Icon(Icons.pause),
+                          label: const Text('Pause'),
+                        ),
+                        ElevatedButton.icon(
+                          onPressed: () => _sendPayload({'command': 'STOP'}),
+                          icon: const Icon(Icons.stop),
+                          label: const Text('Stop'),
+                        ),
+                      ],
                     ),
-                    ElevatedButton.icon(
-                      onPressed: () => _sendCommand('STOP'),
-                      icon: const Icon(Icons.stop),
-                      label: const Text('Stop'),
+                    const SizedBox(height: 16),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: DropdownButtonFormField<double>(
+                            value: _selectedSpeed,
+                            decoration: const InputDecoration(
+                              labelText: 'Playback Speed',
+                              border: OutlineInputBorder(),
+                              isDense: true,
+                            ),
+                            items: const [0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
+                                .map((s) => DropdownMenuItem(value: s, child: Text('${s}x Speed')))
+                                .toList(),
+                            onChanged: (val) {
+                              if (val == null) return;
+                              setState(() => _selectedSpeed = val);
+                              _sendPayload({'command': 'SPEED', 'speed': val});
+                            },
+                          ),
+                        ),
+                        const SizedBox(width: 12),
+                        if (_extractedQualities.isNotEmpty)
+                          Expanded(
+                            child: DropdownButtonFormField<StreamQualityOption>(
+                              value: _selectedQuality,
+                              decoration: const InputDecoration(
+                                labelText: 'Stream Quality',
+                                border: OutlineInputBorder(),
+                                isDense: true,
+                              ),
+                              items: _extractedQualities
+                                  .map((q) => DropdownMenuItem(value: q, child: Text(q.label)))
+                                  .toList(),
+                              onChanged: (q) {
+                                if (q == null) return;
+                                setState(() => _selectedQuality = q);
+                                _sendPayload({
+                                  'command': 'QUALITY',
+                                  'url': q.url,
+                                  'qualityLabel': q.label,
+                                });
+                              },
+                            ),
+                          ),
+                      ],
                     ),
                   ],
                 ),
               ),
             ),
+
           const SizedBox(height: 16),
-          if (_extractedStreams.isNotEmpty)
-            const Text(
-              'Extracted Ad-Free Streams (Tap to Play on TV):',
-              style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15),
+          if (_extractedQualities.isNotEmpty) ...[
+            Text(
+              'Ready to Cast: $_extractedTitle',
+              style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15, color: Colors.tealAccent),
             ),
-          const SizedBox(height: 8),
-          ..._extractedStreams.map(
-            (streamUrl) => Card(
-              margin: const EdgeInsets.only(bottom: 8),
-              child: ListTile(
-                leading: const Icon(Icons.play_circle_fill, color: Colors.tealAccent, size: 32),
-                title: Text(
-                  streamUrl.contains('.m3u8') ? 'HLS / IPTV Stream (.m3u8)' : 'Direct Video Stream',
-                  style: const TextStyle(fontWeight: FontWeight.bold),
-                ),
-                subtitle: Text(streamUrl, maxLines: 2, overflow: TextOverflow.ellipsis),
-                trailing: ElevatedButton(
-                  onPressed: () => _sendCommand('PLAY', streamUrl: streamUrl),
-                  child: const Text('Cast Now'),
+            const SizedBox(height: 8),
+            ..._extractedQualities.map(
+              (q) => Card(
+                margin: const EdgeInsets.only(bottom: 8),
+                child: ListTile(
+                  leading: const Icon(Icons.hd, color: Colors.tealAccent, size: 32),
+                  title: Text('Quality: ${q.label}', style: const TextStyle(fontWeight: FontWeight.bold)),
+                  subtitle: Text(q.url, maxLines: 1, overflow: TextOverflow.ellipsis),
+                  trailing: ElevatedButton.icon(
+                    onPressed: () {
+                      setState(() => _selectedQuality = q);
+                      _castStreamToTv(
+                        streamUrl: q.url,
+                        title: _extractedTitle,
+                        originalUrl: _urlInputCtrl.text.trim(),
+                        qualities: _extractedQualities,
+                        qualityLabel: q.label,
+                      );
+                    },
+                    icon: const Icon(Icons.cast),
+                    label: const Text('Cast Now'),
+                  ),
                 ),
               ),
             ),
-          ),
+          ],
         ],
       ),
     );
   }
 }
 
+// ============================================================================
+// QR SCANNER PAGE (Single-Scan Lock)
+// ============================================================================
 class QrScannerPage extends StatefulWidget {
   const QrScannerPage({super.key});
 
@@ -1077,7 +2100,7 @@ class _QrScannerPageState extends State<QrScannerPage> {
     if (_hasScanned) return;
     for (final barcode in capture.barcodes) {
       final String? code = barcode.rawValue;
-      if (code != null && code.startsWith('ws://')) {
+      if (code != null && (code.startsWith('ws://') || code.startsWith('{'))) {
         _hasScanned = true;
         _scannerController.stop();
         if (mounted) {
